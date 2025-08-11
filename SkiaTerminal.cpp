@@ -59,7 +59,9 @@ HANDLE EnsureKernel32Loaded() {
 
 #include <fcntl.h>
 #include <sys/ioctl.h>
+#ifndef __linux
 #include <sys/ttycom.h>
+#endif
 #include <sys/ttydefaults.h>
 #include <unistd.h>
 #include <termios.h>
@@ -151,7 +153,7 @@ static void handle_size_change(ApplicationState* state, SDL_Window* window, SkCa
     SkDebugf("resize row %d col %d\n", gState->fRow, gState->fCol);
 
     if (!resize_conpty(dw, dh, gState->fRow, gState->fCol, fd)) {
-        SkDebugf("resize_conpty: failed to resize conpty");
+        SkDebugf("resize_conpty: failed to resize conpty\n");
         return;
     }
     tsm_screen_resize(screen, gState->fRow, gState->fCol);
@@ -202,6 +204,8 @@ static void handle_events(ApplicationState* state, SDL_Window* window, SkCanvas*
                             tsm_screen_sb_page_down(screen, 1);
                             state->fRedraw = true;
                             return;
+                        default:
+                            break;
                     }
                 }
 
@@ -739,7 +743,7 @@ static bool create_conpty(int dw, int dh, int ws_row, int ws_col, int *fd, Appli
     if (pid == 0) {
         ::setenv("TERM", "xterm-256color", 1);
         const char* childArgv[] = {"/bin/bash", "-la", nullptr};
-        ::execve(childArgv[0], (char**)childArgv, (char**)environ);
+        ::execve(childArgv[0], const_cast<char**>(childArgv), const_cast<char**>(environ));
         return false;
     }
 
@@ -794,10 +798,11 @@ static SkPath create_star() {
 
 #define KMSG_LINE_MAX (1024 - 32)
 
-static void log_tsm(void* data, const char* file, int line, const char* fn, const char* subs,
+static __attribute__((__format__(__printf__, 7, 0)))
+void log_tsm(void* data, const char* file, int line, const char* fn, const char* subs,
                     unsigned int sev, const char* format, va_list args) {
     char buffer[KMSG_LINE_MAX];
-    int len = snprintf(buffer, KMSG_LINE_MAX, "<%i>sdl[%d]: %s: ", sev, getpid(), subs);
+    int len = snprintf(buffer, KMSG_LINE_MAX, "<%ui>sdl[%d]: %s: ", sev, getpid(), subs);
     if (len < 0) return;
     if (len < KMSG_LINE_MAX - 1) vsnprintf(buffer + len, KMSG_LINE_MAX - len, format, args);
     SkDebugf("%s\n", buffer);
@@ -816,25 +821,41 @@ static void term_write_cb(struct tsm_vte* vte, const char* u8, size_t len, void*
         }
     }
 }
-static int term_read_cb(struct tsm_vte* vte, char* u8, size_t len, int fd) {
-    int read_len = recv(fd, u8, len, 0);
-    if (read_len < 0) {
+static long term_read_cb(struct tsm_vte* vte, char* u8, size_t len, int fd) {
+    long ret = recv(fd, u8, len, 0);
+    if (ret == 0) {
+        SkDebugf("term_read_cb: read EOF\n");
+    } else if (ret < 0) {
         int lastError = GetLastError();
         if (lastError != ERROR_IO_PENDING && lastError != WSAEWOULDBLOCK) {
             HRESULT hr = HRESULT_FROM_WIN32(lastError);
             SkDebugf("term_read_cb: recv %s\n",
                 std::system_category().message(hr).c_str());
         }
+        return -lastError;
     }
-    return read_len;
+    return ret;
 }
 #else
 static void term_write_cb(struct tsm_vte* vte, const char* u8, size_t len, void* data) {
     int fd = reinterpret_cast<intptr_t>(data);
-    write(fd, u8, len);
+    int ret = write(fd, u8, len);
+    int cerrno = errno;
+    if (ret < 0 || ret < static_cast<int>(len)) {
+        SkDebugf("term_write_cb: send %s\n",
+                 std::system_category().message(cerrno).c_str());
+    }
 }
-static int term_read_cb(struct tsm_vte* vte, char* u8, size_t len, int fd) {
-    return read(fd, u8, len);
+static long term_read_cb(struct tsm_vte* vte, char* u8, size_t len, int fd) {
+    long ret = read(fd, u8, len);
+    long cerrno = errno;
+    if (ret == 0) {
+        SkDebugf("term_read_cb: read EOF\n");
+    } else if (ret < 0 && cerrno != EINTR && cerrno != EAGAIN && cerrno != EWOULDBLOCK) {
+        SkDebugf("term_read_cb: read %s\n",
+                 std::system_category().message(cerrno).c_str());
+    }
+    return ret >= 0 ? ret : -cerrno;
 }
 #endif
 
@@ -1164,6 +1185,11 @@ int SDL_main(int argc, char** argv) {
 int main(int argc, char** argv) {
 #endif
 
+    // FIXME buggy input with SDL integration
+#ifdef __linux
+    ::unsetenv("XMODIFIERS");
+#endif
+
     uint32_t windowFlags = 0;
 
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
@@ -1396,7 +1422,7 @@ int main(int argc, char** argv) {
         SkDebugf("init: failed to create conpty\n");
         return -1;
     }
-    SkDebugf("init: conpty created");
+    SkDebugf("init: conpty created\n");
 
     // create a software-based virtual terminal
     struct tsm_screen* screen = nullptr;
@@ -1419,14 +1445,21 @@ int main(int argc, char** argv) {
         canvas->clear(SK_ColorWHITE);
         handle_events(&state, window, canvas, fd, screen, vte);
 
-        int read_len = -1;
+        long ret = -1;
         char buf[4096];
-        read_len = term_read_cb(vte, buf, sizeof(buf), fd);
-        if (read_len > 0) {
-            SkDebugf("term_read_cb: %d\n", read_len);
-            tsm_vte_input(vte, buf, read_len);
+        ret = term_read_cb(vte, buf, sizeof(buf), fd);
+        if (ret > 0) {
+            SkDebugf("term_read_cb: %ld\n", ret);
+            tsm_vte_input(vte, buf, ret);
             state.fRedraw = true;
-        } else if (read_len == 0) {
+        }
+#ifdef _WIN32
+        else if (ret == -ERROR_IO_PENDING || ret == -WSAEWOULDBLOCK) {
+#else
+        else if (ret == -EINTR || ret == -EAGAIN || ret == -EWOULDBLOCK) {
+#endif
+            continue;
+        } else {
             break;
         }
 
