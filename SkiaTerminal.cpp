@@ -51,8 +51,8 @@ typedef HRESULT (__stdcall *PFNCREATEPSEUDOCONSOLE)(COORD c, HANDLE hIn, HANDLE 
 typedef HRESULT (__stdcall *PFNRESIZEPSEUDOCONSOLE)(HPCON hpc, COORD newSize);
 typedef void (__stdcall *PFNCLOSEPSEUDOCONSOLE)(HPCON hpc);
 
-HANDLE EnsureKernel32Loaded() {
-    return LoadLibraryExW(L"kernel32.dll", 0, 0);
+HMODULE EnsureKernel32Loaded() {
+    return GetModuleHandleW(L"kernel32.dll");
 }
 #else
 #include <errno.h>
@@ -84,7 +84,7 @@ extern char **environ;
 #define DEFAULT_COL 24
 
 #ifdef SK_BUILD_FOR_WIN
-#define DEFAULT_FONT "新宋体"
+#define DEFAULT_FONT "Consolas"
 #else
 #define DEFAULT_FONT "monospace"
 #endif
@@ -107,7 +107,7 @@ struct ApplicationState {
     ApplicationState() : fQuit(false), fRedraw(false), fFontSize(12.0), fFontAdvanceWidth(), fFontSpacing() {}
     // Storage for the user created rectangles. The last one may still be being edited.
     std::vector<SkRect> fRects;
-    bool fQuit;
+    std::atomic_bool fQuit;
     bool fRedraw;
     float fFontSize;
     float fFontAdvanceWidth;
@@ -119,6 +119,7 @@ struct ApplicationState {
     int32_t fDw;
     int32_t fDh;
 #ifdef SK_BUILD_FOR_WIN
+    HANDLE fMonitorThread;
     HANDLE fSendThread;
     HANDLE fRecvThread;
 #endif
@@ -413,10 +414,11 @@ void __cdecl send_wndc(LPVOID lp) {
         hr = WriteFileN(reinterpret_cast<HANDLE>(ctx->socket), szBuffer, dwBytesRead, &dwBytesWritten, &ovWrite);
         if (FAILED(hr)) {
             SkDebugf("WriteFileN(): write tsm error %s\n",
-                std::system_category().message(hr).c_str());
+                     std::system_category().message(hr).c_str());
             break;
         }
         SkDebugf("WriteFileN(): write tsm %d\n", static_cast<int>(dwBytesWritten));
+
     } while (fRead);
 
     SkDebugf("send EOF\n");
@@ -446,8 +448,8 @@ void __cdecl recv_wndc(LPVOID lp) {
         int retVal = select(1, &rfds, nullptr, nullptr, &tv);
         if (retVal == -1) {
             hr = HRESULT_FROM_WIN32(GetLastError());
-            SkDebugf("select(): read tsm error 0x%lx %s\n", hr,
-                std::system_category().message(hr).c_str());
+            SkDebugf("select(): read tsm error %s\n",
+                     std::system_category().message(hr).c_str());
             break;
         } else if (retVal == 0) {
             /* No data/event to socket */
@@ -465,8 +467,8 @@ void __cdecl recv_wndc(LPVOID lp) {
                 continue;
             }
             hr = HRESULT_FROM_WIN32(lastError);
-            SkDebugf("ReadFile(): read tsm error 0x%lx %s\n", hr,
-                std::system_category().message(hr).c_str());
+            SkDebugf("ReadFile(): read tsm error %s\n",
+                     std::system_category().message(hr).c_str());
             break;
         }
         SkDebugf("ReadFile(): read tsm %d\n", static_cast<int>(dwBytesRead));
@@ -475,6 +477,32 @@ void __cdecl recv_wndc(LPVOID lp) {
     } while (fRead);
 
     SkDebugf("recv EOF\n");
+    gState->fQuit = true;
+}
+
+void __cdecl monitor_wndc(LPVOID lp) {
+    listen_ctx *ctx { reinterpret_cast<listen_ctx*>(lp) };
+    HRESULT hr = S_OK;
+
+    while (!gState->fQuit) {
+      DWORD retVal = WaitForSingleObject(ctx->hProcess, 100);
+      switch (retVal) {
+        case WAIT_OBJECT_0:
+            goto gone;
+        case WAIT_FAILED:
+            hr = HRESULT_FROM_WIN32(GetLastError());
+            SkDebugf("WaitForSingleObject(): error %s\n",
+                     std::system_category().message(hr).c_str());
+            goto gone;
+        case WAIT_TIMEOUT:
+            break;
+        default:
+            break;
+      }
+    }
+
+gone:
+    SkDebugf("monitor EOF\n");
     gState->fQuit = true;
 }
 
@@ -540,9 +568,9 @@ fail:
 }
 
 static bool create_conpty(int dw, int dh, int ws_row, int ws_col, SOCKET *fd, ApplicationState *state) {
-    HANDLE hLibrary = EnsureKernel32Loaded();
+    HMODULE hLibrary = EnsureKernel32Loaded();
     HRESULT hr = S_OK;
-    PFNCREATEPSEUDOCONSOLE const CreatePseudoConsole = (PFNCREATEPSEUDOCONSOLE)GetProcAddress((HMODULE)hLibrary, "CreatePseudoConsole");
+    PFNCREATEPSEUDOCONSOLE const CreatePseudoConsole = (PFNCREATEPSEUDOCONSOLE)GetProcAddress(hLibrary, "CreatePseudoConsole");
     if (CreatePseudoConsole == nullptr) {
         return false;
     }
@@ -560,7 +588,7 @@ static bool create_conpty(int dw, int dh, int ws_row, int ws_col, SOCKET *fd, Ap
         !::CreatePipe(&outPipeOurSide, &outPipePseudoConsoleSide, nullptr, 0)) {
         hr = HRESULT_FROM_WIN32(GetLastError());
         SkDebugf("conpty: CreatePipe %s\n",
-            std::system_category().message(hr).c_str());
+                 std::system_category().message(hr).c_str());
         return false;
     }
 
@@ -570,7 +598,7 @@ static bool create_conpty(int dw, int dh, int ws_row, int ws_col, SOCKET *fd, Ap
     hr = CreatePseudoConsole(consize, inPipePseudoConsoleSide, outPipePseudoConsoleSide, 0, &hPC);
     if (FAILED(hr)) {
         SkDebugf("conpty: CreatePseudoConsole %s\n",
-            std::system_category().message(hr).c_str());
+                 std::system_category().message(hr).c_str());
         return false;
     }
 
@@ -581,7 +609,7 @@ static bool create_conpty(int dw, int dh, int ws_row, int ws_col, SOCKET *fd, Ap
     hr = InitializeStartupInfoAttachedToConPTY(&startupInfoEx, hPC);
     if (FAILED(hr)) {
         SkDebugf("conpty: InitializeStartupInfoAttachedToConPTY %s\n",
-            std::system_category().message(hr).c_str());
+                 std::system_category().message(hr).c_str());
         ::CloseHandle(inPipeOurSide);
         ::CloseHandle(outPipeOurSide);
         ::CloseHandle(inPipePseudoConsoleSide);
@@ -611,7 +639,7 @@ static bool create_conpty(int dw, int dh, int ws_row, int ws_col, SOCKET *fd, Ap
     if (!fSuccess) {
         hr = HRESULT_FROM_WIN32(GetLastError());
         SkDebugf("conpty: CreateProcessW %s\n",
-            std::system_category().message(hr).c_str());
+                 std::system_category().message(hr).c_str());
         ::CloseHandle(inPipeOurSide);
         ::CloseHandle(outPipeOurSide);
         goto cleanup;
@@ -626,7 +654,7 @@ static bool create_conpty(int dw, int dh, int ws_row, int ws_col, SOCKET *fd, Ap
     if (socketpair(&ctx->socket, &client) < 0) {
         hr = HRESULT_FROM_WIN32(GetLastError());
         SkDebugf("conpty: socketpair %s\n",
-            std::system_category().message(hr).c_str());
+                 std::system_category().message(hr).c_str());
         fSuccess = false;
         goto cleanup;
     }
@@ -635,6 +663,8 @@ static bool create_conpty(int dw, int dh, int ws_row, int ws_col, SOCKET *fd, Ap
     // Create & start thread to listen to the incoming pipe
     // Note: Using CRT-safe _beginthread() rather than CreateThread()
     gListenCtx = ctx;
+    gState->fMonitorThread = reinterpret_cast<HANDLE>(_beginthread(monitor_wndc, 0, ctx));
+    SkDebugf("monitor thread began\n");
     gState->fSendThread = reinterpret_cast<HANDLE>(_beginthread(send_wndc, 0, ctx));
     SkDebugf("send thread began\n");
     gState->fRecvThread = reinterpret_cast<HANDLE>(_beginthread(recv_wndc, 0, ctx));
@@ -649,9 +679,9 @@ cleanup:
 }
 
 static bool resize_conpty(int dw, int dh, int ws_row, int ws_col, SOCKET /*fd*/) {
-    HANDLE hLibrary = EnsureKernel32Loaded();
+    HMODULE hLibrary = EnsureKernel32Loaded();
     HRESULT hr = S_OK;
-    PFNRESIZEPSEUDOCONSOLE const ResizePseudoConsole = (PFNRESIZEPSEUDOCONSOLE)GetProcAddress((HMODULE)hLibrary, "ResizePseudoConsole");
+    PFNRESIZEPSEUDOCONSOLE const ResizePseudoConsole = (PFNRESIZEPSEUDOCONSOLE)GetProcAddress(hLibrary, "ResizePseudoConsole");
     if (ResizePseudoConsole == nullptr) {
         return false;
     }
@@ -667,7 +697,7 @@ static bool resize_conpty(int dw, int dh, int ws_row, int ws_col, SOCKET /*fd*/)
     hr = ResizePseudoConsole(gListenCtx->hPC, consize);
     if (FAILED(hr)) {
         SkDebugf("resize: ResizePseudoConsole %s",
-            std::system_category().message(hr).c_str());
+                 std::system_category().message(hr).c_str());
         return false;
     }
     return true;
@@ -676,14 +706,16 @@ static bool resize_conpty(int dw, int dh, int ws_row, int ws_col, SOCKET /*fd*/)
 static void close_conpty(SOCKET /*fd*/) {
     listen_ctx* ctx = gListenCtx;
     // Close ConPTY - this will terminate client process if running
-    HANDLE hLibrary = EnsureKernel32Loaded();
-    PFNCLOSEPSEUDOCONSOLE const ClosePseudoConsole = (PFNCLOSEPSEUDOCONSOLE)GetProcAddress((HMODULE)hLibrary, "ClosePseudoConsole");
+    HMODULE hLibrary = EnsureKernel32Loaded();
+    PFNCLOSEPSEUDOCONSOLE const ClosePseudoConsole = (PFNCLOSEPSEUDOCONSOLE)GetProcAddress(hLibrary, "ClosePseudoConsole");
     if (ClosePseudoConsole == nullptr) {
-        return;
+        goto cleanup;
     }
 
     // Close ConPTY - this will terminate client process if running
     ClosePseudoConsole(ctx->hPC);
+
+cleanup:
     // Clean-up the pipes
     ::CloseHandle(ctx->inPipeOurSide);
     ::CloseHandle(ctx->outPipeOurSide);
@@ -811,18 +843,18 @@ void log_tsm(void* data, const char* file, int line, const char* fn, const char*
 
 #if defined(SK_BUILD_FOR_WIN)
 static void term_write_cb(struct tsm_vte* vte, const char* u8, size_t len, void* data) {
-    int fd = reinterpret_cast<intptr_t>(data);
+    SOCKET fd = reinterpret_cast<SOCKET>(data);
     int send_len = send(fd, u8, len, 0);
     if (send_len < 0 || send_len < static_cast<int>(len)) {
         int lastError = GetLastError();
         if (lastError != ERROR_IO_PENDING && lastError != WSAEWOULDBLOCK) {
             HRESULT hr = HRESULT_FROM_WIN32(lastError);
             SkDebugf("term_write_cb: send %s\n",
-                std::system_category().message(hr).c_str());
+                     std::system_category().message(hr).c_str());
         }
     }
 }
-static long term_read_cb(struct tsm_vte* vte, char* u8, size_t len, int fd) {
+static long term_read_cb(struct tsm_vte* vte, char* u8, size_t len, SOCKET fd) {
     long ret = recv(fd, u8, len, 0);
     if (ret == 0) {
         SkDebugf("term_read_cb: read EOF\n");
@@ -831,7 +863,7 @@ static long term_read_cb(struct tsm_vte* vte, char* u8, size_t len, int fd) {
         if (lastError != ERROR_IO_PENDING && lastError != WSAEWOULDBLOCK) {
             HRESULT hr = HRESULT_FROM_WIN32(lastError);
             SkDebugf("term_read_cb: recv %s\n",
-                std::system_category().message(hr).c_str());
+                     std::system_category().message(hr).c_str());
         }
         return -lastError;
     }
@@ -1107,7 +1139,7 @@ static SkDPI retrieveMonitorDPI(HMONITOR hMonitor)
     HRESULT hr = ::GetDpiForMonitor(hMonitor, MDT_EFFECTIVE_DPI, &dpiX, &dpiY);
     if (FAILED(hr)) {
         SkDebugf("GetDpiForMonitor(): %s\n",
-                std::system_category().message(hr).c_str());
+                 std::system_category().message(hr).c_str());
         return SkDPI(0, 0);
     }
 
@@ -1123,13 +1155,12 @@ static bool iterateMonitorImpl(HMONITOR hMonitor, SkDPI *dpi_out)
     if (!result) {
         HRESULT hr = HRESULT_FROM_WIN32(GetLastError());
         SkDebugf("GetMonitorInfoA(): 0x%p %s\n", hMonitor,
-                std::system_category().message(hr).c_str());
+                 std::system_category().message(hr).c_str());
         return false;
     }
 
     if (std::wstring(mi.szDevice) == L"WinDisc") {
-        SkDebugf("ignore display device: 0x%p %ls\n", hMonitor,
-            mi.szDevice);
+        SkDebugf("ignore display device: 0x%p %ls\n", hMonitor, mi.szDevice);
         return false;
     }
 
@@ -1145,7 +1176,7 @@ static bool iterateMonitorImpl(HMONITOR hMonitor, SkDPI *dpi_out)
     if (!hdc) {
         HRESULT hr = HRESULT_FROM_WIN32(GetLastError());
         SkDebugf("CreateDC(): %ls %s\n", mi.szDevice,
-                std::system_category().message(hr).c_str());
+                 std::system_category().message(hr).c_str());
         return false;
     }
 
@@ -1170,11 +1201,11 @@ static HRESULT retrieveDPI(SkDPI *dpi)
 {
     HRESULT hr = S_OK;
     BOOL result = ::EnumDisplayMonitors(nullptr, nullptr,
-        (MONITORENUMPROC)iterateMonitor, (LPARAM)dpi);
+        (MONITORENUMPROC)(void*)iterateMonitor, (LPARAM)dpi);
     if (!result) {
         hr = HRESULT_FROM_WIN32(GetLastError());
         SkDebugf("EnumDisplayMonitors(): %s\n",
-                std::system_category().message(hr).c_str());
+                 std::system_category().message(hr).c_str());
     }
     return hr;
 }
@@ -1234,7 +1265,7 @@ int main(int argc, char** argv) {
     HRESULT hr = ::SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE);
     if (FAILED(hr)) {
         SkDebugf("SetProcessDpiAwareness(): %s\n",
-                std::system_category().message(hr).c_str());
+                 std::system_category().message(hr).c_str());
     }
 #else
     BOOL result = ::SetProcessDPIAware();
@@ -1242,14 +1273,14 @@ int main(int argc, char** argv) {
     if (!result) {
         hr = HRESULT_FROM_WIN32(GetLastError());
         SkDebugf("SetProcessDpiAware(): %s\n",
-                std::system_category().message(hr).c_str());
+                 std::system_category().message(hr).c_str());
     }
 #endif
     SkDPI dpi;
     hr = retrieveDPI(&dpi);
     if (FAILED(hr)) {
         SkDebugf("retrieveDPI(): %s\n",
-                std::system_category().message(hr).c_str());
+                 std::system_category().message(hr).c_str());
     }
     SkDebugf("DPI x: %d y: %d\n", dpi.first, dpi.second);
 #endif
@@ -1509,12 +1540,15 @@ int main(int argc, char** argv) {
     }
 
 #ifdef SK_BUILD_FOR_WIN
-    TerminateThread(state.fSendThread, /*dwExitCode*/ 0);
-    WaitForSingleObject(state.fSendThread, INFINITE);
-    SkDebugf("send thread exited\n");
     TerminateThread(state.fRecvThread, /*dwExitCode*/ 0);
     WaitForSingleObject(state.fRecvThread, INFINITE);
     SkDebugf("recv thread exited\n");
+    TerminateThread(state.fSendThread, /*dwExitCode*/ 0);
+    WaitForSingleObject(state.fSendThread, INFINITE);
+    SkDebugf("send thread exited\n");
+    TerminateThread(state.fMonitorThread, /*dwExitCode*/ 0);
+    WaitForSingleObject(state.fMonitorThread, INFINITE);
+    SkDebugf("monitor thread exited\n");
 #endif
 
     close_conpty(fd);
