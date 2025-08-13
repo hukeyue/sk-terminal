@@ -520,54 +520,78 @@ int socketpair(SOCKET *sfd, SOCKET *cfd) {
 
     iResult = WSAStartup(MAKEWORD(2,2), &wsaData);
     if (iResult != NO_ERROR) {
-      SkDebugf("Error at WSAStartup()\n");
-      return -1;
+        int err = WSAGetLastError();
+        SkDebugf("WSAStartup(): %s\n", std::system_category().message(err).c_str());
+        return -1;
     }
 
-    SOCKET fd, accepted_fd = INVALID_SOCKET, server_fd;
+    SOCKET fd = INVALID_SOCKET, accepted_fd = INVALID_SOCKET, server_fd = INVALID_SOCKET;
     struct sockaddr_in server {}, client {};
     int client_len = sizeof(client), server_len = sizeof(server);
     u_long val = 1;
 
     fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd == INVALID_SOCKET) {
+        int err = WSAGetLastError();
+        SkDebugf("socket(): %s\n", std::system_category().message(err).c_str());
+        goto fail;
+    }
     server_fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd == INVALID_SOCKET || server_fd == INVALID_SOCKET) {
+    if (server_fd == INVALID_SOCKET) {
+        int err = WSAGetLastError();
+        SkDebugf("socket(): %s\n", std::system_category().message(err).c_str());
         goto fail;
     }
 
     server.sin_family = AF_INET;
     server.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     server.sin_port = htons(0);
+
+    val = 1;
     if (::bind(fd, (struct sockaddr*)&server, sizeof(server)) < 0 ||
         ::listen(fd, 1) < 0 ||
         ::getsockname(fd, (struct sockaddr*)&server, &server_len) < 0 ||
         ::ioctlsocket(server_fd, FIONBIO, &val) < 0) /* Make connect() non-blocking. */ {
-        SkDebugf("Error at bind()\n");
+        int err = WSAGetLastError();
+        SkDebugf("bind(): %s\n", std::system_category().message(err).c_str());
         goto fail;
     }
+
     if (::connect(server_fd, (struct sockaddr*)&server, sizeof(server)) < 0) {
         int err = WSAGetLastError();
         if (err != WSAEWOULDBLOCK && err != WSAEINPROGRESS && err != WSAEINTR) {
-            SkDebugf("Error at connect()\n");
+            SkDebugf("connect(): %s\n", std::system_category().message(err).c_str());
             goto fail;
         }
     }
 
+    val = 1;
     if ((accepted_fd = ::accept(fd, (struct sockaddr*)&client, &client_len)) == INVALID_SOCKET ||
-        ::ioctlsocket(accepted_fd, FIONBIO, &val) < 0) {
-        SkDebugf("Error at accept()\n");
+        ::ioctlsocket(accepted_fd, FIONBIO, &val) < 0) /* Make connect() non-blocking. */ {
+        int err = WSAGetLastError();
+        SkDebugf("accept(): %s\n", std::system_category().message(err).c_str());
         goto fail;
     }
+
+    // TODO check accept socket
 
     ::closesocket(fd);
     *sfd = accepted_fd;
     *cfd = server_fd;
 
     return 0;
+
 fail:
-    ::closesocket(fd);
-    ::closesocket(server_fd);
-    ::closesocket(accepted_fd);
+    if (fd != INVALID_SOCKET)
+        ::closesocket(fd);
+    if (accepted_fd != INVALID_SOCKET)
+        ::closesocket(accepted_fd);
+    if (server_fd != INVALID_SOCKET)
+        ::closesocket(server_fd);
+
+    *sfd = INVALID_SOCKET;
+    *cfd = INVALID_SOCKET;
+
     return -1;
 }
 
@@ -576,6 +600,7 @@ static bool create_conpty(int dw, int dh, int ws_row, int ws_col, SOCKET *fd, Ap
     HRESULT hr = S_OK;
     PFNCREATEPSEUDOCONSOLE const CreatePseudoConsole = (PFNCREATEPSEUDOCONSOLE)GetProcAddress(hLibrary, "CreatePseudoConsole");
     if (CreatePseudoConsole == nullptr) {
+        SkDebugf("FATAL: CreatePseudoConsole not found\n");
         return false;
     }
 
@@ -656,9 +681,6 @@ static bool create_conpty(int dw, int dh, int ws_row, int ws_col, SOCKET *fd, Ap
     ctx->hThread = process_information.hThread;
     ctx->hProcess = process_information.hProcess;
     if (socketpair(&ctx->socket, &client) < 0) {
-        hr = HRESULT_FROM_WIN32(GetLastError());
-        SkDebugf("conpty: socketpair %s\n",
-                 std::system_category().message(hr).c_str());
         fSuccess = false;
         goto cleanup;
     }
@@ -687,6 +709,7 @@ static bool resize_conpty(int dw, int dh, int ws_row, int ws_col, socket_t /*fd*
     HRESULT hr = S_OK;
     PFNRESIZEPSEUDOCONSOLE const ResizePseudoConsole = (PFNRESIZEPSEUDOCONSOLE)GetProcAddress(hLibrary, "ResizePseudoConsole");
     if (ResizePseudoConsole == nullptr) {
+        SkDebugf("FATAL: ResizePseudoConsole not found\n");
         return false;
     }
 
@@ -713,6 +736,7 @@ static void close_conpty(SOCKET /*fd*/) {
     HMODULE hLibrary = EnsureKernel32Loaded();
     PFNCLOSEPSEUDOCONSOLE const ClosePseudoConsole = (PFNCLOSEPSEUDOCONSOLE)GetProcAddress(hLibrary, "ClosePseudoConsole");
     if (ClosePseudoConsole == nullptr) {
+        SkDebugf("FATAL: ClosePseudoConsole not found\n");
         goto cleanup;
     }
 
