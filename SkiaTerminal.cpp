@@ -18,7 +18,6 @@
 #include "include/gpu/ganesh/gl/GrGLDirectContext.h"
 #include "include/gpu/ganesh/gl/GrGLInterface.h"
 #include "include/gpu/ganesh/gl/GrGLTypes.h"
-#include "src/base/SkRandom.h"
 #include "src/gpu/ganesh/gl/GrGLUtil.h"
 #include "tools/ToolUtils.h"
 #include "tools/fonts/FontToolUtils.h"
@@ -129,7 +128,7 @@ struct ApplicationState {
 #endif
 };
 
-static void handle_error() {
+static void handle_sdl_error() {
     const char* error = SDL_GetError();
     SkDebugf("SDL Error: %s\n", error);
     SDL_ClearError();
@@ -139,7 +138,7 @@ static SkFont *gFont, *gFontBold;
 static ApplicationState *gState;
 
 static void handle_size_change(ApplicationState* state, SDL_Window* window, SkCanvas* canvas,
-                               int fd, struct tsm_screen* screen, struct tsm_vte* vte) {
+                               socket_t fd, struct tsm_screen* screen, struct tsm_vte* vte) {
     int dw, dh;
     state->fFontAdvanceWidth = gFont->measureText("X", 1U, SkTextEncoding::kUTF8, nullptr);
     state->fFontSpacing = std::min(1.0f, gFont->getSpacing());
@@ -166,8 +165,8 @@ static void handle_size_change(ApplicationState* state, SDL_Window* window, SkCa
     state->fRedraw = true;
 }
 
-static void handle_events(ApplicationState* state, SDL_Window* window, SkCanvas* canvas,
-                          int fd, struct tsm_screen* screen, struct tsm_vte* vte) {
+static void handle_sdl_events(ApplicationState* state, SDL_Window* window, SkCanvas* canvas,
+                              socket_t fd, struct tsm_screen* screen, struct tsm_vte* vte) {
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
         switch (event.type) {
@@ -809,7 +808,7 @@ static bool resize_conpty(int dw, int dh, int ws_row, int ws_col, socket_t fd) {
     return true;
 }
 
-static void close_conpty(int fd) {
+static void close_conpty(socket_t fd) {
     close(fd);
 }
 #endif
@@ -911,7 +910,8 @@ static void term_write_cb(struct tsm_vte* vte, const char* u8, size_t len, void*
         state->fQuit = true;
     }
 }
-static long term_read_cb(struct tsm_vte* vte, char* u8, size_t len, int fd,
+
+static long term_read_cb(struct tsm_vte* vte, char* u8, size_t len, socket_t fd,
                          bool *is_eof, bool *should_retry) {
     long ret;
     do {
@@ -1170,6 +1170,52 @@ static int draw_cb(struct tsm_screen* con,
     return 0;
 }
 
+static sk_sp<SkImage> draw_star_image(SkCanvas *canvas) {
+    SkPaint paint;
+    paint.setAntiAlias(true);
+
+    // create a surface for CPU rasterization
+    sk_sp<SkSurface> cpuSurface(SkSurfaces::Raster(canvas->imageInfo()));
+
+    SkCanvas* offscreen = cpuSurface->getCanvas();
+    offscreen->save();
+    paint.setColor(SK_ColorLTGRAY); // FIXME Better Color?
+    offscreen->translate(50.0f, 50.0f);
+    offscreen->drawPath(create_star(), paint);
+    offscreen->restore();
+
+    return cpuSurface->makeImageSnapshot();
+}
+
+static sk_sp<SkImage> draw_term_image(SkCanvas *canvas, ApplicationState *state,
+                                      struct tsm_vte* vte, struct tsm_screen* screen) {
+    SkPaint paint;
+    paint.setAntiAlias(true);
+
+    sk_sp<SkSurface> cpuSurface(SkSurfaces::Raster(canvas->imageInfo()));
+    SkCanvas* offscreen = cpuSurface->getCanvas();
+
+    struct tsm_screen_attr a;
+    tsm_vte_get_def_attr(vte, &a);
+    SkColor bc = term_get_bc_from_attr(&a);
+
+    offscreen->save();
+    offscreen->clear(bc);
+    // offscreen->clear(SK_ColorTRANSPARENT);
+
+    struct draw_ctx draw_ctx = { offscreen, state, &paint, true };
+    // draw background
+    tsm_screen_draw(screen, draw_cb, &draw_ctx);
+
+    // draw frontground
+    draw_ctx.bcOnly = false;
+    tsm_screen_draw(screen, draw_cb, &draw_ctx);
+
+    offscreen->restore();
+    return cpuSurface->makeImageSnapshot();
+}
+
+
 /* Used by atexit handler */
 static SDL_GLContext glContext;
 static SDL_Window* window;
@@ -1334,7 +1380,7 @@ int main(int argc, char** argv) {
      * In a real application you might want to initialize more subsystems
      */
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) {
-        handle_error();
+        handle_sdl_error();
         return 1;
     }
 
@@ -1366,7 +1412,7 @@ int main(int argc, char** argv) {
     // This code will create a window with the same resolution as the user's desktop.
     SDL_DisplayMode dm;
     if (SDL_GetDesktopDisplayMode(0, &dm) != 0) {
-        handle_error();
+        handle_sdl_error();
         return 1;
     }
 
@@ -1382,7 +1428,7 @@ int main(int argc, char** argv) {
     window = SDL_CreateWindow("SkTerminal", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, dm.w, dm.h, windowFlags);
 
     if (!window) {
-        handle_error();
+        handle_sdl_error();
         return 1;
     }
 
@@ -1395,13 +1441,13 @@ int main(int argc, char** argv) {
     // try and setup a GL context
     glContext = SDL_GL_CreateContext(window);
     if (!glContext) {
-        handle_error();
+        handle_sdl_error();
         return 1;
     }
 
     int success = SDL_GL_MakeCurrent(window, glContext);
     if (success != 0) {
-        handle_error();
+        handle_sdl_error();
         return success;
     }
 
@@ -1472,20 +1518,8 @@ int main(int argc, char** argv) {
     state.fWidthScale = (double)dw / dm.w;
     state.fHeightScale = (double)dh / dm.h;
     SkDebugf("scale: width: %.02f, height: %.02f\n", state.fWidthScale, state.fHeightScale);
-
-    SkPaint paint;
-    paint.setAntiAlias(true);
-
-    // create a surface for CPU rasterization
-    sk_sp<SkSurface> cpuSurface(SkSurfaces::Raster(canvas->imageInfo()));
-
-    SkCanvas* offscreen = cpuSurface->getCanvas();
-    offscreen->save();
-    offscreen->translate(50.0f, 50.0f);
-    offscreen->drawPath(create_star(), paint);
-    offscreen->restore();
-
-    sk_sp<SkImage> image = cpuSurface->makeImageSnapshot();
+    sk_sp<SkImage> starImage = draw_star_image(canvas);
+    sk_sp<SkImage> termImage;
 
     TsmVteCtx vte_ctx { &state, invalid_socket_t };
     int ws_row = (float)(dm.w) / state.fFontAdvanceWidth;
@@ -1507,16 +1541,13 @@ int main(int argc, char** argv) {
 
     tsm_vte_new(&vte, screen, term_write_cb, &vte_ctx, log_tsm, screen);
 
-    sk_sp<SkImage> termImage;
-
     int rotation = 0;
 
     while (!state.fQuit) {  // Our application loop
         state.fRedraw = false;
 
-        SkRandom rand;
         canvas->clear(SK_ColorWHITE);
-        handle_events(&state, window, canvas, vte_ctx.fd, screen, vte);
+        handle_sdl_events(&state, window, canvas, vte_ctx.fd, screen, vte);
 
         long ret = -1;
         char buf[4096];
@@ -1534,41 +1565,19 @@ int main(int argc, char** argv) {
         }
 
         if (state.fRedraw) {
-            struct tsm_screen_attr a;
-            tsm_vte_get_def_attr(vte, &a);
-            SkColor bc = term_get_bc_from_attr(&a);
-
-            offscreen->save();
-            offscreen->clear(bc);
-            // offscreen->clear(SK_ColorTRANSPARENT);
-
-            struct draw_ctx draw_ctx = { offscreen, &state, &paint, true };
-            // draw background
-            tsm_screen_draw(screen, draw_cb, &draw_ctx);
-
-            // draw frontground
-            draw_ctx.bcOnly = false;
-            tsm_screen_draw(screen, draw_cb, &draw_ctx);
-
-            offscreen->restore();
-            termImage = cpuSurface->makeImageSnapshot();
+            termImage = draw_term_image(canvas, &state, vte, screen);
         }
 
-        // draw terminal canvas
+        // draw offscreen terminal canvas
         canvas->save();
         canvas->drawImage(termImage, 0, 0);
         canvas->restore();
 
-        for (unsigned int i = 0; i < state.fRects.size(); i++) {
-            paint.setColor(rand.nextU() | 0x44808080);
-            canvas->drawRect(state.fRects[i], paint);
-        }
-
-        // draw offscreen canvas
+        // draw offscreen star canvas
         canvas->save();
-        canvas->translate(state.fDw, state.fDh);
+        canvas->translate(dm.w / 2.0 , dm.h / 2.0);
         canvas->rotate(rotation++);
-        canvas->drawImage(image, -50.0f, -50.0f);
+        canvas->drawImage(starImage, -50.0f, -50.0f);
         canvas->restore();
 
         auto dContext = GrAsDirectContext(canvas->recordingContext());
