@@ -1558,7 +1558,8 @@ int main(int argc, char** argv) {
             tsm_vte_input(vte, buf, ret);
             state.fRedraw = true;
         } else if (should_retry) {
-            continue;
+            SDL_Delay(16); // FIXME
+            goto redraw;
         } else {
             SkASSERT(is_eof);
             break;
@@ -1568,6 +1569,7 @@ int main(int argc, char** argv) {
             termImage = draw_term_image(canvas, &state, vte, screen);
         }
 
+redraw:
         // draw offscreen terminal canvas
         canvas->save();
         canvas->drawImage(termImage, 0, 0);
