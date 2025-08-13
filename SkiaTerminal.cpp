@@ -90,10 +90,14 @@ extern char **environ;
 #endif
 
 #ifdef SK_BUILD_FOR_WIN
-static bool resize_conpty(int dw, int dh, int ws_row, int ws_col, SOCKET fd);
+typedef SOCKET socket_t;
+constexpr socket_t invalid_socket_t = INVALID_SOCKET;
 #else
-static bool resize_conpty(int dw, int dh, int ws_row, int ws_col, int fd);
+typedef int socket_t;
+constexpr socket_t invalid_socket_t = -1;
 #endif
+
+static bool resize_conpty(int dw, int dh, int ws_row, int ws_col, socket_t fd);
 
 /*
  * This application is a simple example of how to combine SDL and Skia it demonstrates:
@@ -428,6 +432,7 @@ void __cdecl send_wndc(LPVOID lp) {
 void __cdecl recv_wndc(LPVOID lp) {
     listen_ctx *ctx { reinterpret_cast<listen_ctx*>(lp) };
     HRESULT hr = S_OK;
+    int err;
 
     const DWORD BUFF_SIZE{ 512 };
     char szBuffer[BUFF_SIZE]{};
@@ -447,9 +452,9 @@ void __cdecl recv_wndc(LPVOID lp) {
         FD_SET(ctx->socket, &rfds);
         int retVal = select(1, &rfds, nullptr, nullptr, &tv);
         if (retVal == -1) {
-            hr = HRESULT_FROM_WIN32(GetLastError());
+            err = WSAGetLastError();
             SkDebugf("select(): read tsm error %s\n",
-                     std::system_category().message(hr).c_str());
+                     std::system_category().message(err).c_str());
             break;
         } else if (retVal == 0) {
             /* No data/event to socket */
@@ -678,7 +683,7 @@ cleanup:
     return fSuccess;
 }
 
-static bool resize_conpty(int dw, int dh, int ws_row, int ws_col, SOCKET /*fd*/) {
+static bool resize_conpty(int dw, int dh, int ws_row, int ws_col, socket_t /*fd*/) {
     HMODULE hLibrary = EnsureKernel32Loaded();
     HRESULT hr = S_OK;
     PFNRESIZEPSEUDOCONSOLE const ResizePseudoConsole = (PFNRESIZEPSEUDOCONSOLE)GetProcAddress(hLibrary, "ResizePseudoConsole");
@@ -789,7 +794,7 @@ static bool create_conpty(int dw, int dh, int ws_row, int ws_col, int *fd, Appli
     return true;
 }
 
-static bool resize_conpty(int dw, int dh, int ws_row, int ws_col, int fd) {
+static bool resize_conpty(int dw, int dh, int ws_row, int ws_col, socket_t fd) {
     struct winsize ws;
 
     ws.ws_row = ws_row;
@@ -841,54 +846,94 @@ void log_tsm(void* data, const char* file, int line, const char* fn, const char*
     SkDebugf("%s\n", buffer);
 }
 
+struct TsmVteCtx {
+    ApplicationState *state;
+    socket_t fd;
+};
+
 #if defined(SK_BUILD_FOR_WIN)
 static void term_write_cb(struct tsm_vte* vte, const char* u8, size_t len, void* data) {
-    SOCKET fd = reinterpret_cast<SOCKET>(data);
+    auto state = reinterpret_cast<TsmVteCtx*>(data)->state;
+    socket_t fd = reinterpret_cast<TsmVteCtx*>(data)->fd;
     int send_len = send(fd, u8, len, 0);
-    if (send_len < 0 || send_len < static_cast<int>(len)) {
-        int lastError = GetLastError();
-        if (lastError != ERROR_IO_PENDING && lastError != WSAEWOULDBLOCK) {
-            HRESULT hr = HRESULT_FROM_WIN32(lastError);
+    if (send_len < 0) {
+        int err = WSAGetLastError();
+        if (err != WSAEWOULDBLOCK && err != WSAEINPROGRESS && err != WSAEINTR) {
             SkDebugf("term_write_cb: send %s\n",
-                     std::system_category().message(hr).c_str());
+                     std::system_category().message(err).c_str());
+            state->fQuit = true;
         }
+    } else if (send_len < static_cast<int>(len)) {
+        SkDebugf("term_write_cb: partial send %d expected %d\n",
+                 send_len, static_cast<int>(len));
+        state->fQuit = true;
     }
 }
-static long term_read_cb(struct tsm_vte* vte, char* u8, size_t len, SOCKET fd) {
+static long term_read_cb(struct tsm_vte* vte, char* u8, size_t len, SOCKET fd,
+                         bool *is_eof, bool *should_retry) {
     long ret = recv(fd, u8, len, 0);
     if (ret == 0) {
         SkDebugf("term_read_cb: read EOF\n");
+        *is_eof = true;
     } else if (ret < 0) {
-        int lastError = GetLastError();
-        if (lastError != ERROR_IO_PENDING && lastError != WSAEWOULDBLOCK) {
-            HRESULT hr = HRESULT_FROM_WIN32(lastError);
+        int err = WSAGetLastError();
+        if (err != WSAEWOULDBLOCK && err != WSAEINPROGRESS && err != WSAEINTR) {
             SkDebugf("term_read_cb: recv %s\n",
-                     std::system_category().message(hr).c_str());
+                     std::system_category().message(err).c_str());
+            *is_eof = true;
+        } else {
+            *should_retry = true;
         }
-        return -lastError;
     }
     return ret;
 }
 #else
 static void term_write_cb(struct tsm_vte* vte, const char* u8, size_t len, void* data) {
-    int fd = reinterpret_cast<intptr_t>(data);
-    int ret = write(fd, u8, len);
-    int cerrno = errno;
-    if (ret < 0 || ret < static_cast<int>(len)) {
-        SkDebugf("term_write_cb: send %s\n",
-                 std::system_category().message(cerrno).c_str());
+    auto state = reinterpret_cast<TsmVteCtx*>(data)->state;
+    socket_t fd = reinterpret_cast<TsmVteCtx*>(data)->fd;
+    int send_len;
+    do {
+      send_len = write(fd, u8, len);
+      if (send_len < 0 && errno == EINTR) {
+          continue;
+      }
+    } while(false);
+    if (send_len < 0) {
+        int cerrno = errno;
+        if (cerrno != EAGAIN && cerrno != EWOULDBLOCK) {
+            SkDebugf("term_write_cb: send %s\n",
+                     std::system_category().message(cerrno).c_str());
+            state->fQuit = true;
+        }
+    } else if (send_len < static_cast<int>(len)) {
+        SkDebugf("term_write_cb: partial send %d expected %d\n",
+                 send_len, static_cast<int>(len));
+        state->fQuit = true;
     }
 }
-static long term_read_cb(struct tsm_vte* vte, char* u8, size_t len, int fd) {
-    long ret = read(fd, u8, len);
-    long cerrno = errno;
+static long term_read_cb(struct tsm_vte* vte, char* u8, size_t len, int fd,
+                         bool *is_eof, bool *should_retry) {
+    long ret;
+    do {
+      ret = read(fd, u8, len);
+      if (ret < 0 && errno == EINTR) {
+          continue;
+      }
+    } while(false);
     if (ret == 0) {
         SkDebugf("term_read_cb: read EOF\n");
-    } else if (ret < 0 && cerrno != EINTR && cerrno != EAGAIN && cerrno != EWOULDBLOCK) {
-        SkDebugf("term_read_cb: read %s\n",
-                 std::system_category().message(cerrno).c_str());
+        *is_eof = true;
+    } else if (ret < 0) {
+        long cerrno = errno;
+        if (cerrno != EAGAIN && cerrno != EWOULDBLOCK) {
+            SkDebugf("term_read_cb: read %s\n",
+                     std::system_category().message(cerrno).c_str());
+            *is_eof = true;
+        } else {
+            *should_retry = true;
+        }
     }
-    return ret >= 0 ? ret : -cerrno;
+    return ret;
 }
 #endif
 
@@ -1442,15 +1487,11 @@ int main(int argc, char** argv) {
 
     sk_sp<SkImage> image = cpuSurface->makeImageSnapshot();
 
-#ifdef SK_BUILD_FOR_WIN
-    SOCKET fd {INVALID_SOCKET};
-#else
-    int fd {-1};
-#endif
+    TsmVteCtx vte_ctx { &state, invalid_socket_t };
     int ws_row = (float)(dm.w) / state.fFontAdvanceWidth;
     int ws_col = (float)(dm.h + state.fFontSpacing) / (state.fFontSize + state.fFontSpacing) - 1;
     SkDebugf("init: row %d col %d\n", ws_row, ws_col);
-    if (!create_conpty(dw, dh, ws_row, ws_col, &fd, &state)) {
+    if (!create_conpty(dw, dh, ws_row, ws_col, &vte_ctx.fd, &state)) {
         SkDebugf("init: failed to create conpty\n");
         return -1;
     }
@@ -1464,7 +1505,7 @@ int main(int argc, char** argv) {
     tsm_screen_set_max_sb(screen, 10240);
     tsm_screen_resize(screen, ws_row, ws_col);
 
-    tsm_vte_new(&vte, screen, term_write_cb, reinterpret_cast<void*>(static_cast<intptr_t>(fd)), log_tsm, screen);
+    tsm_vte_new(&vte, screen, term_write_cb, &vte_ctx, log_tsm, screen);
 
     sk_sp<SkImage> termImage;
 
@@ -1475,23 +1516,20 @@ int main(int argc, char** argv) {
 
         SkRandom rand;
         canvas->clear(SK_ColorWHITE);
-        handle_events(&state, window, canvas, fd, screen, vte);
+        handle_events(&state, window, canvas, vte_ctx.fd, screen, vte);
 
         long ret = -1;
         char buf[4096];
-        ret = term_read_cb(vte, buf, sizeof(buf), fd);
+        bool is_eof = false, should_retry = false;
+        ret = term_read_cb(vte, buf, sizeof(buf), vte_ctx.fd, &is_eof, &should_retry);
         if (ret > 0) {
             SkDebugf("term_read_cb: %ld\n", ret);
             tsm_vte_input(vte, buf, ret);
             state.fRedraw = true;
-        }
-#ifdef _WIN32
-        else if (ret == -ERROR_IO_PENDING || ret == -WSAEWOULDBLOCK) {
-#else
-        else if (ret == -EINTR || ret == -EAGAIN || ret == -EWOULDBLOCK) {
-#endif
+        } else if (should_retry) {
             continue;
         } else {
+            SkASSERT(is_eof);
             break;
         }
 
@@ -1504,13 +1542,13 @@ int main(int argc, char** argv) {
             offscreen->clear(bc);
             // offscreen->clear(SK_ColorTRANSPARENT);
 
-            struct draw_ctx ctx = { offscreen, &state, &paint, true };
+            struct draw_ctx draw_ctx = { offscreen, &state, &paint, true };
             // draw background
-            tsm_screen_draw(screen, draw_cb, &ctx);
+            tsm_screen_draw(screen, draw_cb, &draw_ctx);
 
             // draw frontground
-            ctx.bcOnly = false;
-            tsm_screen_draw(screen, draw_cb, &ctx);
+            draw_ctx.bcOnly = false;
+            tsm_screen_draw(screen, draw_cb, &draw_ctx);
 
             offscreen->restore();
             termImage = cpuSurface->makeImageSnapshot();
@@ -1551,7 +1589,7 @@ int main(int argc, char** argv) {
     SkDebugf("monitor thread exited\n");
 #endif
 
-    close_conpty(fd);
+    close_conpty(vte_ctx.fd);
 
     std::atexit([]() {
         if (glContext) {
