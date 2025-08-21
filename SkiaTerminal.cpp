@@ -296,6 +296,7 @@ static void handle_sdl_events(ApplicationState* state, SDL_Window* window, SkCan
                     // TBD paste to vte
                 }
 #endif
+                // FIXME keysym to utf32
                 if (tsm_vte_handle_keyboard(vte, key, 0, 0, key)) {
                   tsm_screen_sb_reset(screen);
                 }
@@ -681,6 +682,7 @@ static bool create_conpty(int dw, int dh, int ws_row, int ws_col, SOCKET *fd, Ap
     ctx->hThread = process_information.hThread;
     ctx->hProcess = process_information.hProcess;
     if (socketpair(&ctx->socket, &client) < 0) {
+        SkDebugf("conpty: socketpair failed\n")
         fSuccess = false;
         goto cleanup;
     }
