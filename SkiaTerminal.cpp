@@ -682,7 +682,7 @@ static bool create_conpty(int dw, int dh, int ws_row, int ws_col, SOCKET *fd, Ap
     ctx->hThread = process_information.hThread;
     ctx->hProcess = process_information.hProcess;
     if (socketpair(&ctx->socket, &client) < 0) {
-        SkDebugf("conpty: socketpair failed\n")
+        SkDebugf("conpty: socketpair failed\n");
         fSuccess = false;
         goto cleanup;
     }
@@ -841,17 +841,17 @@ static void close_conpty(socket_t fd) {
 
 // Creates a star type shape using a SkPath
 static SkPath create_star() {
-    static const int kNumPoints = 5;
+    static const int kNumPoints = 18;
     SkPath concavePath;
     SkPoint points[kNumPoints] = {{0, SkIntToScalar(-50)}};
     SkMatrix rot;
-    rot.setRotate(SkIntToScalar(360) / kNumPoints);
+    rot.setRotate(SkIntToScalar(360 * 5) / kNumPoints);
     for (int i = 1; i < kNumPoints; ++i) {
         rot.mapPoints(points + i, points + i - 1, 1);
     }
     concavePath.moveTo(points[0]);
     for (int i = 0; i < kNumPoints; ++i) {
-        concavePath.lineTo(points[(2 * i) % kNumPoints]);
+        concavePath.lineTo(points[(5 * i) % kNumPoints]);
     }
     concavePath.setFillType(SkPathFillType::kEvenOdd);
     SkASSERT(!concavePath.isConvex());
