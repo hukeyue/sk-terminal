@@ -18,6 +18,7 @@
 #include "include/gpu/ganesh/gl/GrGLBackendSurface.h"
 #include "include/gpu/ganesh/gl/GrGLDirectContext.h"
 #include "include/gpu/gl/GrGLInterface.h"
+#include "include/gpu/gl/egl/GrGLMakeEGLInterface.h"
 #include "include/gpu/gl/GrGLTypes.h"
 #include "src/gpu/ganesh/gl/GrGLUtil.h"
 
@@ -32,7 +33,11 @@
 #elif defined(SK_BUILD_FOR_WIN)
 #include <windows.h>
 #include <shellscalingapi.h>
+#if defined(SK_ANGLE)
+#include <GLES2/gl2.h>
+#else
 #include <GL/gl.h>
+#endif
 #endif
 
 #if defined(SK_BUILD_FOR_WIN)
@@ -95,6 +100,14 @@ typedef int socket_t;
 constexpr socket_t invalid_socket_t = -1;
 #endif
 
+#ifdef SK_BUILD_FOR_WIN
+typedef std::pair<int, int> SkDPI;
+static HRESULT retrieveDPI(SkDPI *dpi, RECT *rect = nullptr);
+#endif
+
+static SkColor term_get_default_fc();
+static SkColor term_get_default_bc();
+
 struct ApplicationState;
 
 static bool resize_conpty(int ws_row, int ws_col, socket_t fd, ApplicationState *state);
@@ -148,14 +161,20 @@ static SkFont *gFont, *gFontBold;
 static ApplicationState *gState;
 static GLState *glState;
 
-static SkCanvas* glGetCanvas(int dw, int dh, uint32_t windowFormat, int contextType, double widthScale, double heightScale) {
+static SkCanvas* glGetCanvas(int dw, int dh, uint32_t windowFormat, int contextType,
+                             double widthScale, double heightScale) {
     glViewport(0, 0, dw, dh);
     glClearColor(1, 1, 1, 1);
     glClearStencil(0);
     glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
 
+#if defined(SK_BUILD_FOR_WIN) && defined(SK_ANGLE)
+    // setup GrContext
+    glState->glInterface = GrGLMakeEGLInterface();
+#else
     // setup GrContext
     glState->glInterface = GrGLMakeNativeInterface();
+#endif
     if (!glState->glInterface.get()) {
         SkDebugf("GrGLMakeNativeInterface Error\n");
         return nullptr;
@@ -191,9 +210,15 @@ static SkCanvas* glGetCanvas(int dw, int dh, uint32_t windowFormat, int contextT
         }
     }
 
-    static const int kMsaaSampleCount = 0;  // 4;
-    static const int kStencilBits = 8;  // Skia needs 8 stencil bits
-    auto target = GrBackendRenderTargets::MakeGL(dw, dh, kMsaaSampleCount, kStencilBits, info);
+    int msaaSampleCount;
+    SDL_GL_GetAttribute(SDL_GL_MULTISAMPLESAMPLES, &msaaSampleCount);
+    SkDebugf("msaaSampleCount %d\n", msaaSampleCount);
+
+    int stencilBits;
+    SDL_GL_GetAttribute(SDL_GL_STENCIL_SIZE, &stencilBits);
+    SkDebugf("stencilBits %d\n", stencilBits);
+
+    auto target = GrBackendRenderTargets::MakeGL(dw, dh, msaaSampleCount, stencilBits, info);
 
     // setup SkSurface
     // To use distance field text, use commented out SkSurfaceProps instead
@@ -214,7 +239,9 @@ static SkCanvas* glGetCanvas(int dw, int dh, uint32_t windowFormat, int contextT
     return canvas;
 }
 
-static void handle_size_change(ApplicationState* state, SDL_Window* window, SkCanvas** canvas,
+static sk_sp<SkImage> draw_star_image(SkCanvas *canvas, float r);
+
+static void handle_size_change(ApplicationState* state, SDL_Window* window, SkCanvas** canvas, sk_sp<SkImage>* starImage,
                                socket_t fd, struct tsm_screen* screen, struct tsm_vte* vte) {
 
     int dw, dh;
@@ -226,6 +253,35 @@ static void handle_size_change(ApplicationState* state, SDL_Window* window, SkCa
 
     SDL_GetWindowSize(window, &state->fDm.w, &state->fDm.h);
     SkDebugf("window: width %d height %d\n", state->fDm.w, state->fDm.h);
+
+    int x, y;
+    SDL_GetWindowPosition(window, &x, &y);
+    x = std::max(x, 0);
+    y = std::max(y, 0);
+    SkDebugf("window: pos x %d y %d\n", x, y);
+
+#ifdef SK_BUILD_FOR_WIN
+    SkDPI dpi;
+    RECT r;
+    r.left = x;
+    r.top = y;
+    r.right = x + 1;
+    r.bottom = y + 1;
+    HRESULT hr = retrieveDPI(&dpi, &r);
+    if (FAILED(hr)) {
+        SkDebugf("retrieveDPI(): %s\n",
+                 std::system_category().message(hr).c_str());
+    }
+    SkDebugf("DPI x: %d y: %d\n", dpi.first, dpi.second);
+
+    state->fWidthScale = dpi.first / 96.0;
+    state->fHeightScale = dpi.second / 96.0;
+
+    SkDebugf("resize: font size %.1f\n", state->fFontSize);
+
+    state->fDm.w /= state->fWidthScale;
+    state->fDm.h /= state->fHeightScale;
+#endif
 
     SDL_GL_GetDrawableSize(window, &dw, &dh);
     SkDebugf("gl: width %d height %d\n", dw, dh);
@@ -242,7 +298,8 @@ static void handle_size_change(ApplicationState* state, SDL_Window* window, SkCa
     SDL_GL_GetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, &contextType);
 
     *canvas = glGetCanvas(dw, dh, windowFormat, contextType, state->fWidthScale, state->fHeightScale);
-    (*canvas)->clear(SK_ColorWHITE);
+    *starImage = draw_star_image(*canvas, 50.0f);
+    (*canvas)->clear(term_get_default_bc());
 
     state->fFontAdvanceWidth = gFont->measureText("X", 1U, SkTextEncoding::kUTF8, nullptr);
     state->fFontSpacing = std::min(1.0f, gFont->getSpacing());
@@ -262,7 +319,7 @@ static void handle_size_change(ApplicationState* state, SDL_Window* window, SkCa
     state->fRedraw = true;
 }
 
-static void handle_sdl_events(ApplicationState* state, SDL_Window* window, SkCanvas** canvas,
+static void handle_sdl_events(ApplicationState* state, SDL_Window* window, SkCanvas** canvas, sk_sp<SkImage>* starImage,
                               socket_t fd, struct tsm_screen* screen, struct tsm_vte* vte) {
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
@@ -294,13 +351,13 @@ static void handle_sdl_events(ApplicationState* state, SDL_Window* window, SkCan
                         state->fFontSize += 1.0 / state->fWidthScale;
                         gFont->setSize(state->fFontSize);
                         gFontBold->setSize(state->fFontSize);
-                        handle_size_change(state, window, canvas, fd, screen, vte);
+                        handle_size_change(state, window, canvas, starImage, fd, screen, vte);
                         return;
                     } else if (key == SDLK_MINUS && state->fFontSize - 1.0f / state->fWidthScale >= 8.0) {
                         state->fFontSize -= 1.0 / state->fWidthScale;
                         gFont->setSize(state->fFontSize);
                         gFontBold->setSize(state->fFontSize);
-                        handle_size_change(state, window, canvas, fd, screen, vte);
+                        handle_size_change(state, window, canvas, starImage, fd, screen, vte);
                         return;
                     }
                 }
@@ -414,7 +471,7 @@ static void handle_sdl_events(ApplicationState* state, SDL_Window* window, SkCan
                 switch (event.window.event) {
                     case SDL_WINDOWEVENT_RESIZED:
                         // Use SDL_GL_GetDrawableSize to measure the layout change
-                        handle_size_change(state, window, canvas, fd, screen, vte);
+                        handle_size_change(state, window, canvas, starImage, fd, screen, vte);
                         break;
                     default:
                         SkDebugf("sdl: window event 0x%x\n", event.window.event);
@@ -484,7 +541,8 @@ struct listen_ctx {
 
 static listen_ctx *gListenCtx;
 
-HRESULT WriteFileN(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite, LPDWORD lpNumberOfBytesWritten, LPOVERLAPPED lpOverlapped) {
+HRESULT WriteFileN(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite, LPDWORD lpNumberOfBytesWritten,
+                   LPOVERLAPPED lpOverlapped) {
     DWORD numberOfBytesWritten;
     HRESULT hr = S_OK;
     *lpNumberOfBytesWritten = 0;
@@ -957,10 +1015,10 @@ static void close_conpty(socket_t fd) {
 #endif
 
 // Creates a star type shape using a SkPath
-static SkPath create_star() {
+static SkPath create_star(float r) {
     static const int kNumPoints = 19;
     SkPath concavePath;
-    SkPoint points[kNumPoints] = {{0, SkIntToScalar(-50)}};
+    SkPoint points[kNumPoints] = {{0, SkIntToScalar(-(int)r)}};
     SkMatrix rot;
     rot.setRotate(SkIntToScalar(360 * 7) / kNumPoints);
     for (int i = 1; i < kNumPoints; ++i) {
@@ -979,8 +1037,8 @@ static SkPath create_star() {
 #define KMSG_LINE_MAX (1024 - 32)
 
 static __attribute__((__format__(__printf__, 7, 0)))
-void log_tsm(void* data, const char* file, int line, const char* fn, const char* subs,
-                    unsigned int sev, const char* format, va_list args) {
+void log_tsm(void* data, const char* file, int line, const char* fn,
+             const char* subs, unsigned int sev, const char* format, va_list args) {
     char buffer[KMSG_LINE_MAX];
     int len = snprintf(buffer, KMSG_LINE_MAX, "<%ui>sdl[%d]: %s: ", sev, getpid(), subs);
     if (len < 0) return;
@@ -1102,7 +1160,9 @@ enum vte_color {
     VTE_COLOR_NUM
 };
 
-static uint8_t VTE_COLOR_palette[VTE_COLOR_NUM][3] = {
+typedef uint8_t VTE_COLOR_palette_t[VTE_COLOR_NUM][3];
+
+static VTE_COLOR_palette_t VTE_COLOR_palette = {
         {0, 0, 0},             /* black */
         {205, 0, 0},           /* red */
         {0, 205, 0},           /* green */
@@ -1123,8 +1183,7 @@ static uint8_t VTE_COLOR_palette[VTE_COLOR_NUM][3] = {
         {229, 229, 229},       /* light grey */
         {0, 0, 0},             /* black */
 };
-#if 0
-static uint8_t VTE_COLOR_palette_solarized[VTE_COLOR_NUM][3] = {
+static VTE_COLOR_palette_t VTE_COLOR_palette_solarized = {
         [VTE_COLOR_BLACK] = {7, 54, 66},             /* black */
         [VTE_COLOR_RED] = {220, 50, 47},             /* red */
         [VTE_COLOR_GREEN] = {133, 153, 0},           /* green */
@@ -1146,7 +1205,7 @@ static uint8_t VTE_COLOR_palette_solarized[VTE_COLOR_NUM][3] = {
         [VTE_COLOR_BACKGROUND] = {7, 54, 66},     /* black */
 };
 
-static uint8_t VTE_COLOR_palette_solarized_black[VTE_COLOR_NUM][3] = {
+static VTE_COLOR_palette_t VTE_COLOR_palette_solarized_black = {
         [VTE_COLOR_BLACK] = {0, 0, 0},               /* black */
         [VTE_COLOR_RED] = {220, 50, 47},             /* red */
         [VTE_COLOR_GREEN] = {133, 153, 0},           /* green */
@@ -1167,8 +1226,7 @@ static uint8_t VTE_COLOR_palette_solarized_black[VTE_COLOR_NUM][3] = {
         [VTE_COLOR_FOREGROUND] = {238, 232, 213}, /* light grey */
         [VTE_COLOR_BACKGROUND] = {0, 0, 0},       /* black */
 };
-
-static uint8_t VTE_COLOR_palette_solarized_white[VTE_COLOR_NUM][3] = {
+static VTE_COLOR_palette_t VTE_COLOR_palette_solarized_white = {
         [VTE_COLOR_BLACK] = {7, 54, 66},             /* black */
         [VTE_COLOR_RED] = {220, 50, 47},             /* red */
         [VTE_COLOR_GREEN] = {133, 153, 0},           /* green */
@@ -1189,7 +1247,45 @@ static uint8_t VTE_COLOR_palette_solarized_white[VTE_COLOR_NUM][3] = {
         [VTE_COLOR_FOREGROUND] = {7, 54, 66},     /* black */
         [VTE_COLOR_BACKGROUND] = {238, 232, 213}, /* light grey */
 };
-#endif
+
+static VTE_COLOR_palette_t *VTE_COLOR_palette_in_runtime = &VTE_COLOR_palette;
+
+enum vte_color_palette_t {
+  t_vte_color_palette = 0x0,
+  t_vte_color_palette_solarized,
+  t_vte_color_palette_solarized_black,
+  t_vte_color_palette_solarized_white,
+};
+static void vte_color_palette_set_type(vte_color_palette_t t) {
+  switch(t) {
+    default:
+    case t_vte_color_palette:
+      VTE_COLOR_palette_in_runtime = &VTE_COLOR_palette;
+      break;
+    case t_vte_color_palette_solarized:
+      VTE_COLOR_palette_in_runtime = &VTE_COLOR_palette_solarized;
+      break;
+    case t_vte_color_palette_solarized_black:
+      VTE_COLOR_palette_in_runtime = &VTE_COLOR_palette_solarized_black;
+      break;
+    case t_vte_color_palette_solarized_white:
+      VTE_COLOR_palette_in_runtime = &VTE_COLOR_palette_solarized_white;
+      break;
+  }
+}
+
+static SkColor term_get_default_fc() {
+  uint8_t fr, fg, fb;
+  uint8_t code;
+
+  code = VTE_COLOR_FOREGROUND;
+
+  fr = (*VTE_COLOR_palette_in_runtime)[code][0];
+  fg = (*VTE_COLOR_palette_in_runtime)[code][1];
+  fb = (*VTE_COLOR_palette_in_runtime)[code][2];
+
+  return SkColorSetARGB(0xFF, fr, fg, fb);
+}
 
 static SkColor term_get_fc_from_attr(const struct tsm_screen_attr* attr) {
     uint8_t fr = attr->fr, fg = attr->fg, fb = attr->fb;
@@ -1201,9 +1297,9 @@ static SkColor term_get_fc_from_attr(const struct tsm_screen_attr* attr) {
 
         if (code >= VTE_COLOR_NUM) code = VTE_COLOR_FOREGROUND;
 
-        fr = VTE_COLOR_palette[code][0];
-        fg = VTE_COLOR_palette[code][1];
-        fb = VTE_COLOR_palette[code][2];
+        fr = (*VTE_COLOR_palette_in_runtime)[code][0];
+        fg = (*VTE_COLOR_palette_in_runtime)[code][1];
+        fb = (*VTE_COLOR_palette_in_runtime)[code][2];
     }
 
     return SkColorSetARGB(0xFF, fr, fg, fb);
@@ -1218,10 +1314,23 @@ static SkColor term_get_bc_from_attr(const struct tsm_screen_attr* attr) {
 
         if (code >= VTE_COLOR_NUM) code = VTE_COLOR_BACKGROUND;
 
-        br = VTE_COLOR_palette[code][0];
-        bg = VTE_COLOR_palette[code][1];
-        bb = VTE_COLOR_palette[code][2];
+        br = (*VTE_COLOR_palette_in_runtime)[code][0];
+        bg = (*VTE_COLOR_palette_in_runtime)[code][1];
+        bb = (*VTE_COLOR_palette_in_runtime)[code][2];
     }
+
+    return SkColorSetARGB(0xFF, br, bg, bb);
+}
+
+static SkColor term_get_default_bc() {
+    uint8_t br, bg, bb;
+    uint8_t code;
+
+    code = VTE_COLOR_BACKGROUND;
+
+    br = (*VTE_COLOR_palette_in_runtime)[code][0];
+    bg = (*VTE_COLOR_palette_in_runtime)[code][1];
+    bb = (*VTE_COLOR_palette_in_runtime)[code][2];
 
     return SkColorSetARGB(0xFF, br, bg, bb);
 }
@@ -1313,7 +1422,7 @@ static int draw_cb(struct tsm_screen* con,
     return 0;
 }
 
-static sk_sp<SkImage> draw_star_image(SkCanvas *canvas) {
+static sk_sp<SkImage> draw_star_image(SkCanvas *canvas, float r) {
     SkPaint paint;
     paint.setAntiAlias(true);
 
@@ -1322,9 +1431,9 @@ static sk_sp<SkImage> draw_star_image(SkCanvas *canvas) {
 
     SkCanvas* offscreen = cpuSurface->getCanvas();
     offscreen->save();
-    paint.setColor(SK_ColorLTGRAY); // FIXME Better Color?
-    offscreen->translate(50.0f, 50.0f);
-    offscreen->drawPath(create_star(), paint);
+    paint.setColor(SkColorSetARGB(0xff, 7, 54, 66));
+    offscreen->translate(r, r);
+    offscreen->drawPath(create_star(r), paint);
     offscreen->restore();
 
     return cpuSurface->makeImageSnapshot();
@@ -1360,8 +1469,12 @@ static sk_sp<SkImage> draw_term_image(SkCanvas *canvas, ApplicationState *state,
 
 
 /* Used by atexit handler */
-static SDL_GLContext glContext;
-static SDL_Window* window;
+#if 1
+static SDL_GLContext glContext = nullptr;
+#else
+static SDL_Renderer* renderer = nullptr;
+#endif
+static SDL_Window* window = nullptr;
 
 #ifdef SK_BUILD_FOR_WIN
 typedef std::pair<int, int> SkDPI;
@@ -1431,10 +1544,10 @@ static bool iterateMonitor(HMONITOR hMonitor, HDC /*hdc*/, LPRECT /*rect*/, LPAR
     return true;
 }
 
-static HRESULT retrieveDPI(SkDPI *dpi)
+static HRESULT retrieveDPI(SkDPI *dpi, RECT *rect)
 {
     HRESULT hr = S_OK;
-    BOOL result = ::EnumDisplayMonitors(nullptr, nullptr,
+    BOOL result = ::EnumDisplayMonitors(nullptr, rect,
         (MONITORENUMPROC)(void*)iterateMonitor, (LPARAM)dpi);
     if (!result) {
         hr = HRESULT_FROM_WIN32(GetLastError());
@@ -1456,37 +1569,7 @@ int main(int argc, char** argv) {
     ::unsetenv("XMODIFIERS");
 #endif
 
-    uint32_t windowFlags = 0;
-
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
-
-    glContext = nullptr;
-#if defined(SK_BUILD_FOR_ANDROID) || defined(SK_BUILD_FOR_IOS)
-    // For Android/iOS we need to set up for OpenGL ES and we make the window hi res & full screen
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
-    windowFlags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_BORDERLESS |
-                  SDL_WINDOW_FULLSCREEN_DESKTOP | SDL_WINDOW_ALLOW_HIGHDPI;
-#else
-    // For all other clients we use the core profile and operate in a window
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
-
-    windowFlags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE;
-#endif
-    static const int kStencilBits = 8;  // Skia needs 8 stencil bits
-    SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 8);
-    SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE, 8);
-    SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE, 8);
-    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
-    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 0);
-    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, kStencilBits);
-
-    SDL_GL_SetAttribute(SDL_GL_ACCELERATED_VISUAL, 1);
-
-    // If you want multisampling, uncomment the below lines and set a sample count
-    static const int kMsaaSampleCount = 0;  // 4;
-    // SDL_GL_SetAttribute(SDL_GL_MULTISAMPLEBUFFERS, 1);
-    // SDL_GL_SetAttribute(SDL_GL_MULTISAMPLESAMPLES, kMsaaSampleCount);
+    SkDebugf("sdl video driver: %s\n", SDL_GetCurrentVideoDriver());
 
 #ifdef SK_BUILD_FOR_WIN
     // It's currently possible to set DPI awareness programmatically on Windows,
@@ -1511,12 +1594,26 @@ int main(int argc, char** argv) {
     }
 #endif
     SkDPI dpi;
-    hr = retrieveDPI(&dpi);
+    hr = retrieveDPI(&dpi, nullptr);
     if (FAILED(hr)) {
         SkDebugf("retrieveDPI(): %s\n",
                  std::system_category().message(hr).c_str());
     }
     SkDebugf("DPI x: %d y: %d\n", dpi.first, dpi.second);
+#endif
+
+    SkDebugf("sdl video driver: %s\n", SDL_GetCurrentVideoDriver());
+
+    ApplicationState state {};
+    gState = &state;
+
+#if defined(SK_BUILD_FOR_WIN) && defined(SK_ANGLE)
+#if 0
+    SDL_SetHint(SDL_HINT_OPENGL_ES_DRIVER, "1");
+    SDL_SetHint(SDL_HINT_VIDEO_FORCE_EGL, "1"); // see https://github.com/libsdl-org/sdl/issues/15031
+#else
+    SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengles2");
+#endif
 #endif
 
     /*
@@ -1526,14 +1623,11 @@ int main(int argc, char** argv) {
         handle_sdl_error();
         return 1;
     }
-
-    ApplicationState state {};
-    gState = &state;
-
+    SkDebugf("sdl video driver: %s\n", SDL_GetCurrentVideoDriver());
 #ifdef SK_BUILD_FOR_WIN
-    gState->fWidthScale = 96.0 / dpi.first;
-    gState->fHeightScale = 96.0 / dpi.second;
-    gState->fFontSize = gState->fFontSize / gState->fWidthScale;
+    gState->fWidthScale = dpi.first / 96.0;
+    gState->fHeightScale = dpi.second / 96.0;
+    gState->fFontSize = gState->fFontSize;
 #else
     gState->fWidthScale = gState->fHeightScale = 1.00;
 #endif
@@ -1553,10 +1647,13 @@ int main(int argc, char** argv) {
 
     // Setup window
     // This code will create a window with the same resolution as the user's desktop.
-    if (SDL_GetDesktopDisplayMode(0, &state.fDm) != 0) {
+    SDL_DisplayMode dm;
+    if (SDL_GetDesktopDisplayMode(0, &dm) != 0) {
         handle_sdl_error();
         return 1;
     }
+    state.fDm = dm;
+    SkDebugf("display: width %d height %d\n", dm.w, dm.h);
 
     // SkASSERT(typeface->isFixedPitch());
     state.fFontAdvanceWidth = gFont->measureText("X", 1U, SkTextEncoding::kUTF8, nullptr);
@@ -1565,38 +1662,105 @@ int main(int argc, char** argv) {
     SkDebugf("default: cell width %f col %f\n", state.fFontAdvanceWidth, state.fFontSize + state.fFontSpacing);
     SkDebugf("default: row %d col %d\n", DEFAULT_ROW, DEFAULT_COL);
     SkDebugf("default: font size %.1f\n", state.fFontSize);
-    state.fDm.w = std::max<float>(state.fDm.w * 0.25f, state.fFontAdvanceWidth * DEFAULT_ROW);
-    state.fDm.h = std::max<float>(state.fDm.h * 0.25f, (state.fFontSize + state.fFontSpacing) * DEFAULT_COL - state.fFontSpacing);
+    state.fDm.w = std::max<float>(state.fDm.w * 0.25f, state.fFontAdvanceWidth * DEFAULT_ROW) * state.fWidthScale;
+    state.fDm.h = std::max<float>(state.fDm.h * 0.25f, (state.fFontSize + state.fFontSpacing) * DEFAULT_COL - state.fFontSpacing) * state.fHeightScale;
 
-    window = SDL_CreateWindow("SkTerminal", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, state.fDm.w, state.fDm.h, windowFlags);
+    uint32_t windowFlags = 0;
+#if defined(SK_BUILD_FOR_ANDROID) || defined(SK_BUILD_FOR_IOS)
+    windowFlags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_BORDERLESS |
+                  SDL_WINDOW_FULLSCREEN_DESKTOP | SDL_WINDOW_ALLOW_HIGHDPI;
+#else
+    windowFlags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE;
+#endif
+
+#if defined(SK_BUILD_FOR_ANDROID) || defined(SK_BUILD_FOR_IOS) || defined(SK_ANGLE)
+    // set up for OpenGL ES
+#if 1
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_EGL, 1);
+#endif
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+#else
+    // For all other clients we use the core profile and operate in a window
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+#endif
+
+    static const int kStencilBits = 8;  // Skia needs 8 stencil bits
+    SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 0);
+    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, kStencilBits);
+
+    SDL_GL_SetAttribute(SDL_GL_ACCELERATED_VISUAL, 1);
+
+    // If you want multisampling, uncomment the below lines and set a sample count
+    static const int kMsaaSampleCount = 0;  // 4;
+    // SDL_GL_SetAttribute(SDL_GL_MULTISAMPLEBUFFERS, 1);
+    // SDL_GL_SetAttribute(SDL_GL_MULTISAMPLESAMPLES, kMsaaSampleCount);
+
+    int posx = (dm.w - state.fDm.w) / 2.0f;
+    int posy = (dm.h - state.fDm.h) / 2.0f;
+    window = SDL_CreateWindow("SkTerminal", posx, posy, state.fDm.w, state.fDm.h, windowFlags);
 
     if (!window) {
         handle_sdl_error();
         return 1;
     }
 
+#if defined(SK_BUILD_FOR_ANDROID) || defined(SK_BUILD_FOR_IOS)
     // To go fullscreen
     // SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN);
-
+#else
     // Enable Resizable
     SDL_SetWindowResizable(window, SDL_TRUE);
+#endif
 
-    // try and setup a GL context
+#if 1
     glContext = SDL_GL_CreateContext(window);
     if (!glContext) {
         handle_sdl_error();
         return 1;
     }
-
-    int success = SDL_GL_MakeCurrent(window, glContext);
-    if (success != 0) {
+    if (SDL_GL_MakeCurrent(window, glContext) != 0) {
         handle_sdl_error();
-        return success;
+        return 1;
     }
+#else
+    // try and setup a GL context
+    renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    if (!renderer) {
+        handle_sdl_error();
+        return 1;
+    }
+    SDL_RendererInfo info;
+    SDL_GetRendererInfo(renderer, &info);
+    SDL_Log("Current Render Driver: %s\n", info.name);
+#endif
+
+#if 0
+    auto pfnGlGetString = (decltype(&glGetString))SDL_GL_GetProcAddress("glGetString");
+    const char* vendorStr = reinterpret_cast<const char*>(pfnGlGetString(GR_GL_VENDOR));
+    SkDebugf("Current GL Vendor: %s\n", vendorStr);
+    const char* renderStr = reinterpret_cast<const char*>(pfnGlGetString(GR_GL_RENDERER));
+    SkDebugf("Current GL Render: %s\n", renderStr);
+    const char* verStr = reinterpret_cast<const char*>(pfnGlGetString(GR_GL_VERSION));
+    SkDebugf("Current GL Version: %s\n", verStr);
+#endif
 
     uint32_t windowFormat = SDL_GetWindowPixelFormat(window);
     int contextType;
     SDL_GL_GetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, &contextType);
+
+    if (contextType == SDL_GL_CONTEXT_PROFILE_ES) {
+        SkDebugf("sdl2: opengles context\n");
+    } else {
+        SkDebugf("sdl2: opengl context\n");
+    }
 
     SDL_GetWindowDisplayMode(window, &state.fDm);
     SkDebugf("window: refresh rate %d\n", state.fDm.refresh_rate);
@@ -1604,10 +1768,40 @@ int main(int argc, char** argv) {
     if (state.fDm.refresh_rate == 0)
       state.fDm.refresh_rate = 60;
 
-    SDL_GetWindowSize(window, &state.fDm.w, &state.fDm.h);
+    int dw = state.fDm.w, dh = state.fDm.h;
+
+    SDL_GetWindowSize(window, &state.fDm.w, &state.fDm.h); // inaccurate with windows
+#ifdef SK_BUILD_FOR_WIN
+    state.fDm.w /= state.fWidthScale;
+    state.fDm.h /= state.fHeightScale;
+#endif
     SkDebugf("window: width %d height %d\n", state.fDm.w, state.fDm.h);
 
-    int dw, dh;
+    int x, y;
+    SDL_GetWindowPosition(window, &x, &y);
+    x = std::max(x, 0);
+    y = std::max(y, 0);
+    SkDebugf("window: pos x %d y %d\n", x, y);
+
+#ifdef SK_BUILD_FOR_WIN
+    RECT r;
+    r.left = x;
+    r.top = y;
+    r.right = x + 1;
+    r.bottom = y + 1;
+    hr = retrieveDPI(&dpi, &r);
+    if (FAILED(hr)) {
+        SkDebugf("retrieveDPI(): %s\n",
+                 std::system_category().message(hr).c_str());
+    }
+    SkDebugf("DPI x: %d y: %d\n", dpi.first, dpi.second);
+
+    state.fWidthScale = dpi.first / 96.0;
+    state.fHeightScale = dpi.second / 96.0;
+
+    SkDebugf("resize: font size %.1f\n", state.fFontSize);
+#endif
+
     SDL_GL_GetDrawableSize(window, &dw, &dh);
     SkDebugf("gl: width %d height %d\n", dw, dh);
 
@@ -1626,7 +1820,7 @@ int main(int argc, char** argv) {
         return -1;
     }
 
-    sk_sp<SkImage> starImage = draw_star_image(canvas);
+    sk_sp<SkImage> starImage = draw_star_image(canvas, 50.0f);
     sk_sp<SkImage> termImage;
 
     TsmVteCtx vte_ctx { &state, invalid_socket_t };
@@ -1650,14 +1844,15 @@ int main(int argc, char** argv) {
     tsm_screen_resize(screen, ws_row, ws_col);
 
     tsm_vte_new(&vte, screen, term_write_cb, &vte_ctx, log_tsm, screen);
+    vte_color_palette_set_type(t_vte_color_palette_solarized_white);
 
     int rotation = 0;
 
     while (!state.fQuit) {  // Our application loop
         state.fRedraw = false;
 
-        canvas->clear(SK_ColorWHITE);
-        handle_sdl_events(&state, window, &canvas, vte_ctx.fd, screen, vte);
+        canvas->clear(term_get_default_bc());
+        handle_sdl_events(&state, window, &canvas, &starImage, vte_ctx.fd, screen, vte);
 
         long ret = -1;
         char buf[4096];
@@ -1741,12 +1936,22 @@ redraw_queued:
     close_conpty(vte_ctx.fd);
 
     std::atexit([]() {
+#if 1
+        // Destory glContext
         if (glContext) {
             SDL_GL_DeleteContext(glContext);
         }
+#else
+        // Remove renderer
+        if (renderer) {
+            SDL_DestroyRenderer(renderer);
+        }
+#endif
 
         // Destroy window
-        SDL_DestroyWindow(window);
+        if (window) {
+            SDL_DestroyWindow(window);
+        }
 
         // Quit SDL subsystems
         SDL_Quit();
