@@ -40,6 +40,8 @@
 #endif
 #endif
 
+#include <signal.h>
+
 #if defined(SK_BUILD_FOR_WIN)
 #include <winsock2.h>
 #ifndef EXTENDED_STARTUPINFO_PRESENT
@@ -125,7 +127,7 @@ struct ApplicationState {
     // Storage for the user created rectangles. The last one may still be being edited.
     std::vector<SkRect> fRects;
     std::atomic_bool fQuit;
-    bool fRedraw = false;
+    bool fRedrawRequired = false;
     bool fRedrawQueued = false;
     uint32_t fRedrawTimerId = 0x0;
     float fFontSize;
@@ -163,11 +165,6 @@ static GLState *glState;
 
 static SkCanvas* glGetCanvas(int dw, int dh, uint32_t windowFormat, int contextType,
                              double widthScale, double heightScale) {
-    glViewport(0, 0, dw, dh);
-    glClearColor(1, 1, 1, 1);
-    glClearStencil(0);
-    glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
-
 #if defined(SK_BUILD_FOR_WIN) && defined(SK_ANGLE)
     // setup GrContext
     glState->glInterface = GrGLMakeEGLInterface();
@@ -180,10 +177,16 @@ static SkCanvas* glGetCanvas(int dw, int dh, uint32_t windowFormat, int contextT
         return nullptr;
     }
 
+    glState->glInterface->fFunctions.fViewport(0, 0, dw, dh);
+    glState->glInterface->fFunctions.fClearColor(1, 1, 1, 1);
+    glState->glInterface->fFunctions.fClearStencil(0);
+    glState->glInterface->fFunctions.fClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+
     // setup contexts
     glState->grContext = GrDirectContexts::MakeGL(glState->glInterface, GrContextOptions());
     if (!glState->grContext.get()) {
         SkDebugf("GrDirectContexts::MakeGL Error\n");
+        glState->glInterface.reset();
         return nullptr;
     }
 
@@ -229,10 +232,19 @@ static SkCanvas* glGetCanvas(int dw, int dh, uint32_t windowFormat, int contextT
     glState->surface = (SkSurfaces::WrapBackendRenderTarget(glState->grContext.get(), target,
                                                             kBottomLeft_GrSurfaceOrigin,
                                                             colorType, nullptr, &props));
+    if (!glState->surface) {
+        SkDebugf("SkSurfaces::WrapBackendRenderTarget Error\n");
+        glState->grContext.reset();
+        glState->glInterface.reset();
+        return nullptr;
+    }
 
     SkCanvas* canvas = glState->surface->getCanvas();
     if (!canvas) {
-        SkDebugf("getCanvas Error\n");
+        SkDebugf("SkSurface::getCanvas Error\n");
+        glState->surface.reset();
+        glState->grContext.reset();
+        glState->glInterface.reset();
         return nullptr;
     }
     canvas->scale(widthScale, heightScale);
@@ -304,8 +316,8 @@ static void handle_size_change(ApplicationState* state, SDL_Window* window, SkCa
     state->fFontAdvanceWidth = gFont->measureText("X", 1U, SkTextEncoding::kUTF8, nullptr);
     state->fFontSpacing = std::min(1.0f, gFont->getSpacing());
 
-    int ws_row = (dw / state->fWidthScale) / state->fFontAdvanceWidth;
-    int ws_col = (dh / state->fHeightScale + state->fFontSpacing) / (state->fFontSize + state->fFontSpacing);
+    int ws_row = std::floorf((dw / state->fWidthScale) / state->fFontAdvanceWidth);
+    int ws_col = std::floorf((dh / state->fHeightScale - state->fFontSpacing) / (state->fFontSize + state->fFontSpacing));
 
     SkDebugf("resize: cell width %f col %f\n", state->fFontAdvanceWidth, state->fFontSize + state->fFontSpacing);
     SkDebugf("resize: row %d col %d\n", ws_row, ws_col);
@@ -316,11 +328,12 @@ static void handle_size_change(ApplicationState* state, SDL_Window* window, SkCa
         return;
     }
     tsm_screen_resize(screen, ws_row, ws_col);
-    state->fRedraw = true;
+    SkDebugf("term_redraw required\n");
+    state->fRedrawRequired = true;
 }
 
 static void handle_sdl_events(ApplicationState* state, SDL_Window* window, SkCanvas** canvas, sk_sp<SkImage>* starImage,
-                              socket_t fd, struct tsm_screen* screen, struct tsm_vte* vte) {
+                              int* rotation, socket_t fd, struct tsm_screen* screen, struct tsm_vte* vte) {
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
         switch (event.type) {
@@ -464,7 +477,8 @@ static void handle_sdl_events(ApplicationState* state, SDL_Window* window, SkCan
                     SkDebugf("sdl: key event %d\n", key);
                     tsm_screen_sb_reset(screen);
                 }
-                state->fRedraw = true;
+                SkDebugf("term_redraw required\n");
+                state->fRedrawRequired = true;
                 break;
             }
             case SDL_WINDOWEVENT: {
@@ -483,8 +497,9 @@ static void handle_sdl_events(ApplicationState* state, SDL_Window* window, SkCan
                 state->fQuit = true;
                 break;
             case SDL_USEREVENT:
-                SkDebugf("user event\n");
+                SkDebugf("term_redraw queued\n");
                 state->fRedrawQueued = true;
+                ++*rotation;
                 break;
             default:
                 break;
@@ -1439,32 +1454,24 @@ static sk_sp<SkImage> draw_star_image(SkCanvas *canvas, float r) {
     return cpuSurface->makeImageSnapshot();
 }
 
-static sk_sp<SkImage> draw_term_image(SkCanvas *canvas, ApplicationState *state,
-                                      struct tsm_vte* vte, struct tsm_screen* screen) {
+static void draw_vte_screen(SkCanvas *canvas, ApplicationState *state, struct tsm_vte* vte, struct tsm_screen* screen) {
     SkPaint paint;
     paint.setAntiAlias(true);
-
-    sk_sp<SkSurface> cpuSurface(SkSurfaces::Raster(canvas->imageInfo()));
-    SkCanvas* offscreen = cpuSurface->getCanvas();
 
     struct tsm_screen_attr a;
     tsm_vte_get_def_attr(vte, &a);
     SkColor bc = term_get_bc_from_attr(&a);
 
-    offscreen->save();
-    offscreen->clear(bc);
-    // offscreen->clear(SK_ColorTRANSPARENT);
+    canvas->clear(bc);
+    // canvas->clear(SK_ColorTRANSPARENT);
 
-    struct draw_ctx draw_ctx = { offscreen, state, &paint, true };
+    struct draw_ctx draw_ctx = { canvas, state, &paint, true };
     // draw background
     tsm_screen_draw(screen, draw_cb, &draw_ctx);
 
     // draw frontground
     draw_ctx.bcOnly = false;
     tsm_screen_draw(screen, draw_cb, &draw_ctx);
-
-    offscreen->restore();
-    return cpuSurface->makeImageSnapshot();
 }
 
 
@@ -1607,6 +1614,24 @@ int main(int argc, char** argv) {
     ApplicationState state {};
     gState = &state;
 
+    // embraces interrupt signal
+    auto signal_handler = [](int sig) {
+        if (sig == SIGINT) {
+            gState->fQuit = true;
+        }
+    };
+    if (signal(SIGINT, signal_handler) != 0) {
+        SkDebugf("SIGINT handler was not enabled.");
+    }
+#ifndef SK_BUILD_FOR_WIN
+    if (signal(SIGPIPE, SIG_IGN) != 0) {
+        SkDebugf("SIGPIPE handler was not disabled properly.");
+    }
+#endif
+
+    // embraces exit call in other place
+    std::atexit([]() { gState->fQuit = true; });
+
 #if defined(SK_BUILD_FOR_WIN) && defined(SK_ANGLE)
 #if 0
     SDL_SetHint(SDL_HINT_OPENGL_ES_DRIVER, "1");
@@ -1662,8 +1687,8 @@ int main(int argc, char** argv) {
     SkDebugf("default: cell width %f col %f\n", state.fFontAdvanceWidth, state.fFontSize + state.fFontSpacing);
     SkDebugf("default: row %d col %d\n", DEFAULT_ROW, DEFAULT_COL);
     SkDebugf("default: font size %.1f\n", state.fFontSize);
-    state.fDm.w = std::max<float>(state.fDm.w * 0.25f, state.fFontAdvanceWidth * DEFAULT_ROW) * state.fWidthScale;
-    state.fDm.h = std::max<float>(state.fDm.h * 0.25f, (state.fFontSize + state.fFontSpacing) * DEFAULT_COL - state.fFontSpacing) * state.fHeightScale;
+    state.fDm.w = std::ceilf(std::max<float>(state.fDm.w * 0.25f, state.fFontAdvanceWidth * DEFAULT_ROW) * state.fWidthScale);
+    state.fDm.h = std::ceilf(std::max<float>(state.fDm.h * 0.25f, (state.fFontSize + state.fFontSpacing) * DEFAULT_COL + state.fFontSpacing) * state.fHeightScale);
 
     uint32_t windowFlags = 0;
 #if defined(SK_BUILD_FOR_ANDROID) || defined(SK_BUILD_FOR_IOS)
@@ -1821,11 +1846,10 @@ int main(int argc, char** argv) {
     }
 
     sk_sp<SkImage> starImage = draw_star_image(canvas, 50.0f);
-    sk_sp<SkImage> termImage;
 
     TsmVteCtx vte_ctx { &state, invalid_socket_t };
-    int ws_row = (float)(state.fDm.w) / state.fFontAdvanceWidth;
-    int ws_col = (float)(state.fDm.h + state.fFontSpacing) / (state.fFontSize + state.fFontSpacing);
+    int ws_row = std::floorf((float)(state.fDm.w) / state.fFontAdvanceWidth);
+    int ws_col = std::floorf((float)(state.fDm.h - state.fFontSpacing) / (state.fFontSize + state.fFontSpacing));
     SkDebugf("init: row %d col %d\n", ws_row, ws_col);
     if (!create_conpty(ws_row, ws_col, &vte_ctx.fd, &state)) {
         SkDebugf("init: failed to create conpty\n");
@@ -1848,11 +1872,38 @@ int main(int argc, char** argv) {
 
     int rotation = 0;
 
+    state.fRedrawTimerId = SDL_AddTimer(1000.0f / state.fDm.refresh_rate,
+                                        [](uint32_t, void*) -> uint32_t {
+        if (gState->fQuit) {
+            SkDebugf("term_redraw canceled\n");
+            return 0;
+        }
+        SkDebugf("term_redraw required\n");
+
+        SDL_Event user_event;
+        SDL_zero(user_event); // Initialize the event structure
+        user_event.type = SDL_USEREVENT; // Custom event type
+        user_event.user.code = 1; // Custom code
+        user_event.user.data1 = NULL;
+        user_event.user.data2 = NULL;
+
+        SDL_PushEvent(&user_event);
+        return 1000.0f / gState->fDm.refresh_rate;
+    }, nullptr);
+
+    if (state.fRedrawTimerId == 0) {
+        SkDebugf("sdl: failed to create redraw timer\n");
+        return 1;
+    }
+
     while (!state.fQuit) {  // Our application loop
-        state.fRedraw = false;
+        state.fRedrawRequired = false;
 
         canvas->clear(term_get_default_bc());
-        handle_sdl_events(&state, window, &canvas, &starImage, vte_ctx.fd, screen, vte);
+        handle_sdl_events(&state, window, &canvas, &starImage, &rotation, vte_ctx.fd, screen, vte);
+        if (state.fQuit) {
+            break;
+        }
 
         long ret = -1;
         char buf[4096];
@@ -1863,55 +1914,40 @@ int main(int argc, char** argv) {
             SkDebugf("term_read_cb: %ld\n", ret);
 #endif
             tsm_vte_input(vte, buf, ret);
-            state.fRedraw = true;
-        } else if (state.fRedrawQueued) {
+            SkDebugf("term_redraw required\n");
+            state.fRedrawRequired = true;
+        } else if (state.fRedrawQueued && !is_eof) {
             goto redraw_queued;
         } else if (should_retry) {
-            goto redraw;
+            goto should_retry;
         } else {
             SkASSERT(is_eof);
             break;
         }
 
-redraw:
-        if (state.fRedraw) {
-            SkDebugf("term_redraw required\n");
-            gState->fRedraw = false;
-            if (state.fRedrawTimerId == 0) {
-                gState->fRedrawTimerId = SDL_AddTimer(1000.0f / state.fDm.refresh_rate,
-                                                      [](uint32_t, void*) -> uint32_t {
-                    SkDebugf("term_redraw queued\n");
-                    gState->fRedrawTimerId = 0;
-
-                    SDL_Event user_event;
-                    SDL_zero(user_event); // Initialize the event structure
-                    user_event.type = SDL_USEREVENT; // Custom event type
-                    user_event.user.code = 1; // Custom code
-                    user_event.user.data1 = NULL;
-                    user_event.user.data2 = NULL;
-
-                    SDL_PushEvent(&user_event);
-                    return 0;
-                }, nullptr);
-            }
+should_retry:
+        if (state.fRedrawRequired) {
+            state.fRedrawRequired = false;
+            SkDebugf("term_redraw queued\n");
+            state.fRedrawQueued = true;
+        } else {
+            SDL_Delay(3.1415926f * 2); // limited to 150 fps
         }
+
+        continue;
 
 redraw_queued:
-        if (state.fRedrawQueued) {
-            SkDebugf("term_redraw triggered\n");
-            state.fRedrawQueued = false;
-            termImage = draw_term_image(canvas, &state, vte, screen);
-        }
+        state.fRedrawQueued = false;
 
-        // draw offscreen terminal canvas
+        // pass 1: draw terminal canvas
         canvas->save();
-        canvas->drawImage(termImage, 0, 0);
+        draw_vte_screen(canvas, &state, vte, screen);
         canvas->restore();
 
-        // draw offscreen star canvas
+        // pass 2: draw star canvas from offline canvas
         canvas->save();
         canvas->translate(state.fDm.w / 2.0 , state.fDm.h / 2.0);
-        canvas->rotate(rotation++);
+        canvas->rotate(rotation);
         canvas->drawImage(starImage, -50.0f, -50.0f);
         canvas->restore();
 
@@ -1919,6 +1955,10 @@ redraw_queued:
         dContext->flushAndSubmit();
 
         SDL_GL_SwapWindow(window);
+    }
+
+    if (uint32_t timerId = state.fRedrawTimerId; timerId != 0) {
+        SDL_RemoveTimer(timerId);
     }
 
 #ifdef SK_BUILD_FOR_WIN
@@ -1935,28 +1975,34 @@ redraw_queued:
 
     close_conpty(vte_ctx.fd);
 
-    std::atexit([]() {
 #if 1
-        // Destory glContext
-        if (glContext) {
-            SDL_GL_DeleteContext(glContext);
-        }
+    // Destory glContext
+    if (glContext) {
+        SDL_GL_DeleteContext(glContext);
+    }
 #else
-        // Remove renderer
-        if (renderer) {
-            SDL_DestroyRenderer(renderer);
-        }
+    // Remove renderer
+    if (renderer) {
+        SDL_DestroyRenderer(renderer);
+    }
 #endif
 
-        // Destroy window
-        if (window) {
-            SDL_DestroyWindow(window);
-        }
+    // Destroy window
+    if (window) {
+        SDL_DestroyWindow(window);
+    }
 
-        // Quit SDL subsystems
-        SDL_Quit();
-        SkDebugf("main thread exited\n");
-    });
+    // Quit SDL subsystems
+    SDL_Quit();
+
+    // Cleanup glState At last
+    if (glState) {
+        glState->surface.reset();
+        glState->grContext.reset();
+        glState->glInterface.reset();
+    }
+
+    SkDebugf("main thread exited\n");
 
     return 0;
 }
