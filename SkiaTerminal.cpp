@@ -87,6 +87,7 @@ extern char **environ;
 
 #define DEFAULT_ROW 80
 #define DEFAULT_COL 24
+#define DEFAULT_STAR_RADIUS 50.0f
 
 #ifdef SK_BUILD_FOR_WIN
 #define DEFAULT_FONT "Consolas"
@@ -318,7 +319,7 @@ static void handle_size_change(ApplicationState* state, SDL_Window* window, SkCa
     SDL_GL_GetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, &contextType);
 
     *canvas = glGetCanvas(dw, dh, windowFormat, contextType, state->fWidthScale, state->fHeightScale);
-    *starImage = draw_star_image(*canvas, 50.0f);
+    *starImage = draw_star_image(*canvas, DEFAULT_STAR_RADIUS);
     (*canvas)->clear(term_get_default_bc());
 
     state->fFontAdvanceWidth = gFont->measureText("X", 1U, SkTextEncoding::kUTF8, nullptr);
@@ -511,7 +512,9 @@ static void handle_sdl_events(ApplicationState* state, SDL_Window* window, SkCan
                 state->fQuit = true;
                 break;
             case SDL_USEREVENT:
+#if 0
                 SkDebugf("term_redraw queued\n");
+#endif
                 state->fRedrawQueued = true;
                 ++*rotation;
                 break;
@@ -1859,7 +1862,7 @@ int main(int argc, char** argv) {
         return -1;
     }
 
-    sk_sp<SkImage> starImage = draw_star_image(canvas, 50.0f);
+    sk_sp<SkImage> starImage = draw_star_image(canvas, DEFAULT_STAR_RADIUS);
 
     TsmVteCtx vte_ctx { &state, invalid_socket_t };
     int ws_row = std::floorf((float)(state.fDm.w) / state.fFontAdvanceWidth);
@@ -1899,7 +1902,9 @@ int main(int argc, char** argv) {
             SkDebugf("term_redraw canceled\n");
             return 0;
         }
+#if 0
         SkDebugf("term_redraw required\n");
+#endif
 
         SDL_Event user_event;
         SDL_zero(user_event); // Initialize the event structure
@@ -1969,7 +1974,7 @@ redraw_queued:
         canvas->save();
         canvas->translate(state.fDm.w / 2.0 , state.fDm.h / 2.0);
         canvas->rotate(rotation);
-        canvas->drawImage(starImage, -50.0f, -50.0f);
+        canvas->drawImage(starImage, -DEFAULT_STAR_RADIUS, -DEFAULT_STAR_RADIUS);
         canvas->restore();
 
         auto dContext = GrAsDirectContext(canvas->recordingContext());
