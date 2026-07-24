@@ -42,6 +42,10 @@
 
 #include <signal.h>
 
+#ifndef _WIN32
+#include <sys/wait.h>  // For waitpid
+#endif
+
 #if defined(SK_BUILD_FOR_WIN)
 #include <winsock2.h>
 #ifndef EXTENDED_STARTUPINFO_PRESENT
@@ -167,6 +171,8 @@ struct ApplicationState {
     HANDLE fMonitorThread;
     HANDLE fSendThread;
     HANDLE fRecvThread;
+#else
+    int fPid;
 #endif
 };
 
@@ -384,6 +390,14 @@ static void handle_sdl_events(ApplicationState* state, SDL_Window* window, SkCan
                 SDL_Keycode key = event.key.keysym.sym;
                 // SDL_Scancode scancode = SDL_GetScancodeFromKey(key);
                 uint16_t modifier = event.key.keysym.mod;
+
+                /* CTRL+q */
+                if (modifier & KMOD_CTRL &&
+                    !(modifier & KMOD_SHIFT) && !(modifier & KMOD_ALT)) {
+                    if (key == SDLK_q) {
+                        exit(0);
+                    }
+                }
 
                 /*  CTRL+SHIFT +/-  Zoom */
                 if (modifier & KMOD_SHIFT && modifier & KMOD_CTRL &&
@@ -1044,11 +1058,11 @@ static bool create_conpty(int ws_row, int ws_col, socket_t *fd, ApplicationState
         SkDebugf("something wrong with forkpty: %s\n", strerror(errno));
         return false;
     }
-
+    state->fPid = pid;
 
     fcntl(*fd, F_SETFL, O_NONBLOCK);
 
-    SkDebugf("forkpty: row %d col %d\n", ws_row, ws_col);
+    SkDebugf("forkpty: pid %d\n", pid);
 
     return true;
 }
@@ -1070,8 +1084,28 @@ static bool resize_conpty(int ws_row, int ws_col, socket_t fd, ApplicationState 
 }
 
 static void close_conpty(socket_t fd, ApplicationState *state) {
-    close(fd);
-    static_cast<void>(state);
+    pid_t pid = state->fPid;
+    int ret;
+    int wstatus;
+
+    // Clean-up the pipes
+    ret = close(fd);
+    if (ret != 0) {
+        SkDebugf("conpty: close pipe %d failed\n", fd);
+    }
+
+    // Now safe to clean-up client app's process-info & thread
+    ret = kill(pid, SIGKILL);
+    static_cast<void>(ret); // better right way is to check with WNOHANG first, we don't bother it.
+
+    ret = waitpid(pid, &wstatus, 0);
+    if (ret >= 0) {
+        ret = WEXITSTATUS(wstatus);
+        SkDebugf("waitpid: pid %d exited code %d\n", pid, ret);
+    } else {
+        SkDebugf("waitpid: pid %d failed\n", pid);
+        static_cast<void>(ret);
+    }
 }
 #endif
 
@@ -1665,9 +1699,15 @@ int main(int argc, char** argv) {
         if (sig == SIGINT) {
             gState->fQuit = true;
         }
+        if (sig == SIGTERM) {
+            gState->fQuit = true;
+        }
     };
     if (signal(SIGINT, signal_handler) != 0) {
         SkDebugf("SIGINT handler was not enabled.");
+    }
+    if (signal(SIGTERM, signal_handler) != 0) {
+        SkDebugf("SIGTERM handler was not enabled.");
     }
 #ifndef SK_BUILD_FOR_WIN
     if (signal(SIGPIPE, SIG_IGN) != 0) {
