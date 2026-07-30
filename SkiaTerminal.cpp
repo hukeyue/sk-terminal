@@ -164,10 +164,10 @@ struct ApplicationState {
     int32_t fDh;
 #ifdef SK_BUILD_FOR_WIN
     sk_sp<WinListenContext> fListenCtx;
-    HANDLE fMonitorThread;
 #else
     pid_t fPid;
 #endif
+    SDL_Thread *fMonitorThread = NULL;
     SDL_Thread *fRedrawNotificationThread = NULL;
     SDL_Thread *fTermNotificationThread = NULL;
 };
@@ -210,6 +210,12 @@ static SkCanvas* glGetCanvas(int dw, int dh, uint32_t windowFormat, int contextT
         SkDebugf("GrGLMakeNativeInterface Error\n");
         return nullptr;
     }
+
+#if 0
+    SkDebugf("SkCurrent GL Vendor: %s\n", glState->glInterface->fFunctions.fGetString(GR_GL_VENDOR));
+    SkDebugf("SkCurrent GL Render: %s\n", glState->glInterface->fFunctions.fGetString(GR_GL_RENDERER));
+    SkDebugf("SkCurrent GL Version: %s\n", glState->glInterface->fFunctions.fGetString(GR_GL_VERSION));
+#endif
 
     glState->glInterface->fFunctions.fViewport(0, 0, dw, dh);
     glState->glInterface->fFunctions.fClearColor(1, 1, 1, 1);
@@ -539,7 +545,7 @@ static void handle_sdl_events(ApplicationState* state, SDL_Window* window, SkCan
                         handle_size_change(state, window, canvas, starImage, vte_ctx, screen, vte);
                         break;
                     default:
-                        SkDebugf("sdl: window event 0x%x\n", event.window.event);
+                        SkDebugf("sdl: window event %d\n", event.window.event);
                         break;
                 }
                 break;
@@ -675,34 +681,6 @@ HRESULT ReadFileN(HANDLE hFile, LPVOID lpBuffer, DWORD nNumberOfBytesToRead, LPD
         nNumberOfBytesToRead -= numberOfBytesRead;
     }
     return hr;
-}
-
-void __cdecl monitor_wndc(LPVOID lp) {
-    ApplicationState *state { reinterpret_cast<ApplicationState*>(lp) };
-    sk_sp<WinListenContext> listen_ctx = state->fListenCtx;
-    HRESULT hr = S_OK;
-    SkDebugf("monitor thread began\n");
-
-    while (!state->fQuit) {
-      DWORD ret = WaitForSingleObject(listen_ctx->hProcess, INFINITE);
-      switch (ret) {
-        case WAIT_OBJECT_0:
-            goto gone;
-        case WAIT_FAILED:
-            hr = HRESULT_FROM_WIN32(GetLastError());
-            SkDebugf("WaitForSingleObject(): error %s\n",
-                     std::system_category().message(hr).c_str());
-            goto gone;
-        case WAIT_TIMEOUT:
-            break;
-        default:
-            break;
-      }
-    }
-
-gone:
-    SkDebugf("monitor thread exited\n");
-    state->fQuit = true;
 }
 
 // conpty: MakeNativeInterface
@@ -900,9 +878,7 @@ static bool create_conpty(int ws_row, int ws_col, TsmVteCtx *vte_ctx, Applicatio
     vte_ctx->outPipeOurSide = outPipeOurSide;
     vte_ctx->inPipeOurSide = inPipeOurSide;
 
-    // Create & start thread to listen to the incoming pipe
-    // Note: Using CRT-safe _beginthread() rather than CreateThread()
-    state->fMonitorThread = reinterpret_cast<HANDLE>(_beginthread(monitor_wndc, 0, state));
+    SkDebugf("CreateProcessW: process %lu\n", process_information.dwProcessId);
 
 cleanup:
     ::DeleteProcThreadAttributeList(startupInfoEx.lpAttributeList);
@@ -942,9 +918,15 @@ static void close_conpty(TsmVteCtx */*ctx*/, ApplicationState *state) {
     // Clean-up the pipes
     ::CloseHandle(listen_ctx->inPipeOurSide);
     ::CloseHandle(listen_ctx->outPipeOurSide);
+    // Terminate process if still runnning
+    ::TerminateProcess(listen_ctx->hProcess, /*uExitCode*/ ~0u);
+}
+
+static void fini_conpty(ApplicationState *state) {
+    sk_sp<WinListenContext> listen_ctx = state->fListenCtx;
+
     // Now safe to clean-up client app's process-info & thread
     ::CloseHandle(listen_ctx->hThread);
-    ::TerminateProcess(listen_ctx->hProcess, /*uExitCode*/ 0);
     ::CloseHandle(listen_ctx->hProcess);
 }
 #else
@@ -1006,14 +988,32 @@ static bool create_conpty(int ws_row, int ws_col, TsmVteCtx *ctx, ApplicationSta
     }
 
     if (pid < 0) {
-        SkDebugf("something wrong with forkpty: %s\n", strerror(errno));
+        errno_t cerrno = errno;
+        SkDebugf("forkpty %s\n",
+                 std::system_category().message(cerrno).c_str());
         return false;
     }
-    state->fPid = pid;
-
-    fcntl(*fd, F_SETFL, O_NONBLOCK);
 
     SkDebugf("forkpty: pid %d\n", pid);
+
+    state->fPid = pid;
+
+#if 0
+    int ret = fcntl(*fd, F_SETFL, O_NONBLOCK | fcntl(*fd, F_GETFL));
+    if (ret < 0) {
+        errno_t cerrno = errno;
+        SkDebugf("fcntl: O_NONBLOCK %s\n",
+                 std::system_category().message(cerrno).c_str());
+    }
+#else
+    int arg = 1;
+    int ret = ioctl(*fd, FIONBIO, &arg);
+    if (ret < 0) {
+        errno_t cerrno = errno;
+        SkDebugf("ioctl: FIONBIO %s\n",
+                 std::system_category().message(cerrno).c_str());
+    }
+#endif
 
     return true;
 }
@@ -1027,11 +1027,12 @@ static bool resize_conpty(int ws_row, int ws_col, TsmVteCtx *ctx, ApplicationSta
     ws.ws_col = ws_row;
 
     if (ioctl(fd, TIOCSWINSZ, &ws) < 0) {
-        SkDebugf("resize_conpty: TIOCSWINSZ %s", strerror(errno));
+        errno_t cerrno = errno;
+        SkDebugf("ioctl: TIOCSWINSZ %s\n",
+                 std::system_category().message(cerrno).c_str());
         return false;
     }
 
-    SkDebugf("TIOCSWINSZ: row %d col %d\n", ws_row, ws_col);
     return true;
 }
 
@@ -1039,42 +1040,55 @@ static void close_conpty(TsmVteCtx *ctx, ApplicationState *state) {
     int fd = ctx->fd;
     pid_t pid = state->fPid;
     int ret;
-    int wstatus;
 
     // Clean-up the pipes
     ret = close(fd);
-    if (ret != 0) {
-        SkDebugf("conpty: close pipe %d failed\n", fd);
+    if (ret < 0) {
+        errno_t cerrno = errno;
+        SkDebugf("conpty: close on fd %d %s\n", fd,
+                 std::system_category().message(cerrno).c_str());
     }
 
+    // Terminate process if still runnning
+    int wstatus;
+    ret = waitpid(pid, &wstatus, WNOHANG);
+    if (ret < 0) {
+        errno_t cerrno = errno;
+        SkDebugf("conpty: waitpid %d %s\n", pid,
+                 std::system_category().message(cerrno).c_str());
+    } else if (ret == 0) {
+        // subprocess is not yet to exit
+        ret = kill(pid, SIGKILL);
+        if (ret < 0) {
+            errno_t cerrno = errno;
+            SkDebugf("conpty: kill on SIGKILL on %d %s\n", pid,
+                     std::system_category().message(cerrno).c_str());
+        }
+    } else /* ret > 0 */ {
+       ret = WEXITSTATUS(wstatus);
+       SkDebugf("conpty: pid %d exited code %d\n", pid, ret);
+    }
+}
+
+static void fini_conpty(ApplicationState *state) {
     // Now safe to clean-up client app's process-info & thread
-    ret = kill(pid, SIGKILL);
-    static_cast<void>(ret); // better right way is to check with WNOHANG first, we don't bother it.
-
-    ret = waitpid(pid, &wstatus, 0);
-    if (ret >= 0) {
-        ret = WEXITSTATUS(wstatus);
-        SkDebugf("waitpid: pid %d exited code %d\n", pid, ret);
-    } else {
-        SkDebugf("waitpid: pid %d failed\n", pid);
-        static_cast<void>(ret);
-    }
+    static_cast<void>(state);
 }
 #endif
 
 // Creates a star type shape using a SkPath
 static SkPath create_star(float r) {
-    static const int kNumPoints = 19;
+    static const int kNumPoints = 59;
     SkPath concavePath;
     SkPoint points[kNumPoints] = {{0, SkIntToScalar(-(int)r)}};
     SkMatrix rot;
-    rot.setRotate(SkIntToScalar(360 * 7) / kNumPoints);
+    rot.setRotate(SkIntToScalar(360 * 5) / kNumPoints);
     for (int i = 1; i < kNumPoints; ++i) {
         rot.mapPoints(points + i, points + i - 1, 1);
     }
     concavePath.moveTo(points[0]);
     for (int i = 0; i < kNumPoints; ++i) {
-        concavePath.lineTo(points[(7 * i) % kNumPoints]);
+        concavePath.lineTo(points[(5 * i) % kNumPoints]);
     }
     concavePath.setFillType(SkPathFillType::kEvenOdd);
     SkASSERT(!concavePath.isConvex());
@@ -1157,7 +1171,7 @@ static void term_write_cb(struct tsm_vte* vte, const char* u8, size_t len, void*
       }
     } while(false);
     if (send_len < 0) {
-        int cerrno = errno;
+        errno_t cerrno = errno;
         if (cerrno != EAGAIN && cerrno != EWOULDBLOCK) {
             SkDebugf("term_write_cb: send %s\n",
                      std::system_category().message(cerrno).c_str());
@@ -1184,7 +1198,7 @@ static long term_read_cb(struct tsm_vte* vte, char* u8, size_t len, bool *is_eof
         SkDebugf("term_read_cb: read EOF\n");
         *is_eof = true;
     } else if (ret < 0) {
-        long cerrno = errno;
+        errno_t cerrno = errno;
         if (cerrno != EAGAIN && cerrno != EWOULDBLOCK) {
             SkDebugf("term_read_cb: read %s\n",
                      std::system_category().message(cerrno).c_str());
@@ -1925,8 +1939,8 @@ int main(int argc, char** argv) {
     state.fCol = ws_col;
 
     // create a software-based virtual terminal
-    struct tsm_screen* screen = nullptr;
-    struct tsm_vte* vte;
+    struct tsm_screen* screen = NULL;
+    struct tsm_vte* vte = NULL;
 
     tsm_screen_new(&screen, log_tsm, screen);
     // increases scrollback size to 500k lines
@@ -1937,6 +1951,59 @@ int main(int argc, char** argv) {
     vte_color_palette_set_type(t_vte_color_palette_solarized_white);
 
     int rotation = 0;
+
+    state.fMonitorThread = SDL_CreateThread([](void *data) -> int {
+        auto state = reinterpret_cast<TsmVteCtx*>(data)->state;
+        SkDebugf("monitor thread began\n");
+#ifdef SK_BUILD_FOR_WIN
+        HRESULT hr = S_OK;
+        HANDLE hProcess = state->fListenCtx->hProcess;
+        DWORD processId = ::GetProcessId(hProcess);
+        DWORD exitCode = ~0;
+
+        DWORD ret = ::WaitForSingleObject(hProcess, INFINITE);
+        switch (ret) {
+            case WAIT_OBJECT_0:
+                break;
+            case WAIT_FAILED:
+            default:
+                hr = HRESULT_FROM_WIN32(GetLastError());
+                SkDebugf("WaitForSingleObject(): error %s\n",
+                         std::system_category().message(hr).c_str());
+                break;
+        }
+        if (SUCCEEDED(hr)) {
+            if (::GetExitCodeProcess(hProcess, &exitCode)) {
+                SkDebugf("GetExitCodeProcess: process %lu exited code %lu\n", processId, exitCode);
+            } else {
+                hr = HRESULT_FROM_WIN32(GetLastError());
+                SkDebugf("GetExitCodeProcess(): process %lu error %s\n", processId,
+                         std::system_category().message(hr).c_str());
+            }
+        }
+#else
+        pid_t pid = state->fPid;
+        int ret;
+        int wstatus, exitCode = -1;
+        ret = waitpid(pid, &wstatus, 0);
+        if (ret >= 0) {
+            exitCode = ret = WEXITSTATUS(wstatus);
+            SkDebugf("waitpid: pid %d exited code %d\n", pid, ret);
+        } else {
+            errno_t cerrno = errno;
+            SkDebugf("waitpid: pid %d %s\n", pid,
+                     std::system_category().message(cerrno).c_str());
+        }
+#endif
+
+        SkDebugf("monitor thread exited\n");
+        state->fQuit = true;
+        return exitCode;
+    }, "monitor", &vte_ctx);
+    if (!state.fMonitorThread) {
+        handle_sdl_error();
+        return 1;
+    }
 
     state.fRedrawNotificationThread = SDL_CreateThread([](void *data) -> int {
         auto state = reinterpret_cast<TsmVteCtx*>(data)->state;
@@ -1956,6 +2023,10 @@ int main(int argc, char** argv) {
         SkDebugf("redraw-notification thread exited\n");
         return 0;
     }, "redraw-notification", &vte_ctx);
+    if (!state.fRedrawNotificationThread) {
+        handle_sdl_error();
+        return 1;
+    }
 
     state.fTermNotificationThread = SDL_CreateThread([](void *data) -> int {
         auto state = reinterpret_cast<TsmVteCtx*>(data)->state;
@@ -1999,8 +2070,9 @@ int main(int argc, char** argv) {
             FD_SET(fd, &rfds);
             int ret = ::select(maxfd + 1, &rfds, NULL, NULL, NULL);
             if (ret == -1) {
+                errno_t cerrno = errno;
                 SkDebugf("select: %s\n",
-                         std::system_category().message(errno).c_str());
+                         std::system_category().message(cerrno).c_str());
                 result = -1;
                 break;
             } else if (ret == 0) {
@@ -2019,15 +2091,16 @@ int main(int argc, char** argv) {
             SDL_PushEvent(&user_event);
 
             SDL_Delay(10.0f + 2);
-        };
+        }
 #else
         int fd = reinterpret_cast<TsmVteCtx*>(data)->fd;
         while (!state->fQuit) {  // Our I/O loop
             int bytes;
             int ret = ioctl(fd, FIONREAD, &bytes);
             if (ret == -1) {
-                SkDebugf("ioctl: %s\n",
-                         std::system_category().message(errno).c_str());
+                errno_t cerrno = errno
+                SkDebugf("ioctl: FIONREAD %s\n",
+                         std::system_category().message(cerrno).c_str());
                 result = -1;
                 break;
             } else if (bytes == 0) {
@@ -2051,6 +2124,10 @@ int main(int argc, char** argv) {
         SkDebugf("term-notification thread exited\n");
         return result;
     }, "term-notification", &vte_ctx);
+    if (!state.fTermNotificationThread) {
+        handle_sdl_error();
+        return 1;
+    }
 
     while (!state.fQuit) {  // Our application loop
         state.fRedrawRequired = false;
@@ -2106,10 +2183,19 @@ redraw_queued:
 
     SDL_WaitThread(state.fRedrawNotificationThread, NULL);
     SDL_WaitThread(state.fTermNotificationThread, NULL);
+    SDL_WaitThread(state.fMonitorThread, NULL);
 
-#ifdef SK_BUILD_FOR_WIN
-    WaitForSingleObject(state.fMonitorThread, INFINITE);
-#endif
+    fini_conpty(&state);
+
+    // Destroy vte object
+    if (vte) {
+        tsm_vte_unref(vte);
+    }
+
+    // Destroy Screen Object
+    if (screen) {
+        tsm_screen_unref(screen);
+    }
 
 #if 1
     // Destory glContext
