@@ -132,18 +132,6 @@ static void update_window_title(SDL_Window *window, const char* name, int ws_row
  *   draw more complex primitives (star)
  */
 
-#ifdef SK_BUILD_FOR_WIN
-struct WinListenContext : public SkRefCnt {
-    PFNCREATEPSEUDOCONSOLE fCreatePseudoConsole;
-    PFNRESIZEPSEUDOCONSOLE fResizePseudoConsole;
-    PFNCLOSEPSEUDOCONSOLE fClosePseudoConsole;
-
-    HANDLE outPipeOurSide, inPipeOurSide;
-    HANDLE hPC;
-    HANDLE hThread, hProcess;
-};
-#endif
-
 struct ApplicationState {
     ApplicationState() : fQuit(false), fFontSize(12.0), fFontAdvanceWidth(), fFontSpacing() {}
     // Storage for the user created rectangles. The last one may still be being edited.
@@ -162,40 +150,50 @@ struct ApplicationState {
     int32_t fCol;
     int32_t fDw;
     int32_t fDh;
-#ifdef SK_BUILD_FOR_WIN
-    sk_sp<WinListenContext> fListenCtx;
+};
+
+struct OsListenContext : public SkRefCnt {
+#if defined(SK_BUILD_FOR_WIN)
+    PFNCREATEPSEUDOCONSOLE fCreatePseudoConsole = &CreatePseudoConsole;
+    PFNRESIZEPSEUDOCONSOLE fResizePseudoConsole = &ResizePseudoConsole;
+    PFNCLOSEPSEUDOCONSOLE fClosePseudoConsole = &ClosePseudoConsole;
+
+    HANDLE outPipeOurSide = INVALID_HANDLE_VALUE, inPipeOurSide = INVALID_HANDLE_VALUE;
+    HPCON hPC = 0;
+    HANDLE hThread = INVALID_HANDLE_VALUE, hProcess = INVALID_HANDLE_VALUE;
 #else
-    pid_t fPid;
+    pid_t pid = -1;
+    int fd = -1;
 #endif
-    SDL_Thread *fMonitorThread = NULL;
-    SDL_Thread *fRedrawNotificationThread = NULL;
-    SDL_Thread *fTermNotificationThread = NULL;
 };
 
 struct TsmVteCtx {
     ApplicationState *state;
-#if defined(SK_BUILD_FOR_WIN)
-    HANDLE outPipeOurSide, inPipeOurSide;
-#else
-    int fd;
-#endif
+    struct tsm_screen *screen;
+    struct tsm_vte *vte;
+    sk_sp<OsListenContext> listen_ctx;
 };
 
 
 struct GLState {
-  sk_sp<const GrGLInterface> glInterface;
-  sk_sp<GrDirectContext> grContext;
-  sk_sp<SkSurface> surface;
+    sk_sp<const GrGLInterface> glInterface;
+    sk_sp<GrDirectContext> grContext;
+    sk_sp<SkSurface> surface;
+
+    SkCanvas *canvas; // binded to surface
+    sk_sp<SkImage> starImage;
 };
 
 static void handle_sdl_error() {
     const char* error = SDL_GetError();
-    SkDebugf("SDL Error: %s\n", error);
+    SkDebugf("SDL Error: %s\n", error); // we use SkDebugf here because SDL might be not initialized
     SDL_ClearError();
 }
 
 static SkFont *gFont, *gFontBold;
 static GLState *glState;
+
+static sk_sp<SkImage> draw_star_image(SkCanvas *canvas, float r);
 
 static SkCanvas* glGetCanvas(int dw, int dh, uint32_t windowFormat, int contextType,
                              double widthScale, double heightScale) {
@@ -215,6 +213,14 @@ static SkCanvas* glGetCanvas(int dw, int dh, uint32_t windowFormat, int contextT
     SkDebugf("SkCurrent GL Vendor: %s\n", glState->glInterface->fFunctions.fGetString(GR_GL_VENDOR));
     SkDebugf("SkCurrent GL Render: %s\n", glState->glInterface->fFunctions.fGetString(GR_GL_RENDERER));
     SkDebugf("SkCurrent GL Version: %s\n", glState->glInterface->fFunctions.fGetString(GR_GL_VERSION));
+#endif
+#if defined(SK_BUILD_FOR_WIN) && defined(SK_ANGLE)
+    GrGLDriverInfo driverInfo = GrGLGetDriverInfo(glState->glInterface.get());
+    if (driverInfo.fANGLEBackend == GrGLANGLEBackend::kD3D11) {
+        SkDebugf("SkCurrent ANGLE backend: d3d11\n");
+    } else if (driverInfo.fANGLEBackend == GrGLANGLEBackend::kD3D9) {
+        SkDebugf("SkCurrent ANGLE backend: d3d9\n");
+    }
 #endif
 
     glState->glInterface->fFunctions.fViewport(0, 0, dw, dh);
@@ -261,7 +267,7 @@ static SkCanvas* glGetCanvas(int dw, int dh, uint32_t windowFormat, int contextT
     SDL_GL_GetAttribute(SDL_GL_STENCIL_SIZE, &stencilBits);
     SkDebugf("stencilBits %d\n", stencilBits);
 
-    auto target = GrBackendRenderTargets::MakeGL(dw, dh, msaaSampleCount, stencilBits, info);
+    GrBackendRenderTarget target = GrBackendRenderTargets::MakeGL(dw, dh, msaaSampleCount, stencilBits, info);
 
     // setup SkSurface
     // To use distance field text, use commented out SkSurfaceProps instead
@@ -288,13 +294,22 @@ static SkCanvas* glGetCanvas(int dw, int dh, uint32_t windowFormat, int contextT
         return nullptr;
     }
     canvas->scale(widthScale, heightScale);
+
+    glState->canvas = canvas;
+    glState->starImage = draw_star_image(canvas, DEFAULT_STAR_RADIUS);
+    if (!glState->starImage) {
+        SkDebugf("draw_star_image Error\n");
+        glState->canvas = nullptr;
+        glState->surface.reset();
+        glState->grContext.reset();
+        glState->glInterface.reset();
+        return nullptr;
+    }
     return canvas;
 }
 
-static sk_sp<SkImage> draw_star_image(SkCanvas *canvas, float r);
-
-static void handle_size_change(ApplicationState* state, SDL_Window* window, SkCanvas** canvas, sk_sp<SkImage>* starImage,
-                               TsmVteCtx* vte_ctx, struct tsm_screen* screen, struct tsm_vte* vte) {
+static void handle_size_change(ApplicationState *state, SDL_Window *window, TsmVteCtx *vte_ctx) {
+    struct tsm_screen *screen = vte_ctx->screen;
 
     int dw, dh;
 
@@ -349,9 +364,12 @@ static void handle_size_change(ApplicationState* state, SDL_Window* window, SkCa
     int contextType;
     SDL_GL_GetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, &contextType);
 
-    *canvas = glGetCanvas(dw, dh, windowFormat, contextType, state->fWidthScale, state->fHeightScale);
-    *starImage = draw_star_image(*canvas, DEFAULT_STAR_RADIUS);
-    (*canvas)->clear(term_get_default_bc());
+    SkCanvas *canvas = glGetCanvas(dw, dh, windowFormat, contextType, state->fWidthScale, state->fHeightScale);
+    if (!canvas) {
+        SkDebugf("FATAL: gl state unavailable\n");
+        return;
+    }
+    canvas->clear(term_get_default_bc());
 
     state->fFontAdvanceWidth = gFont->measureText("X", 1U, SkTextEncoding::kUTF8, nullptr);
     state->fFontSpacing = std::min(1.0f, gFont->getSpacing());
@@ -359,7 +377,7 @@ static void handle_size_change(ApplicationState* state, SDL_Window* window, SkCa
     int ws_row = std::floorf((dw / state->fWidthScale) / state->fFontAdvanceWidth);
     int ws_col = std::floorf((dh / state->fHeightScale - state->fFontSpacing) / (state->fFontSize + state->fFontSpacing));
 
-#ifdef SK_BUILD_FOR_WIN
+#if defined(SK_BUILD_FOR_WIN)
     update_window_title(window, "cmd.exe", ws_row, ws_col);
 #else
     update_window_title(window, "bash", ws_row, ws_col);
@@ -381,9 +399,14 @@ static void handle_size_change(ApplicationState* state, SDL_Window* window, SkCa
 static long term_read_cb(struct tsm_vte* vte, char* u8, size_t len, bool *is_eof,
                          bool *should_retry, TsmVteCtx *vte_ctx);
 
-static void handle_sdl_events(ApplicationState* state, SDL_Window* window, SkCanvas** canvas, sk_sp<SkImage>* starImage,
-                              int* rotation, TsmVteCtx* vte_ctx, struct tsm_screen* screen, struct tsm_vte* vte) {
+#define REFRESH_EVENT     (SDL_USEREVENT + 0)
+#define TTY_INPUT_EVENT   (SDL_USEREVENT + 1)
+
+static void handle_sdl_events(ApplicationState *state, SDL_Window *window, int *rotation, TsmVteCtx *vte_ctx) {
     SDL_Event event;
+
+    struct tsm_screen *screen = vte_ctx->screen;
+    struct tsm_vte *vte = vte_ctx->vte;
     while (SDL_PollEvent(&event)) {
         switch (event.type) {
             case SDL_MOUSEMOTION:
@@ -421,13 +444,13 @@ static void handle_sdl_events(ApplicationState* state, SDL_Window* window, SkCan
                         state->fFontSize += 1.0 / state->fWidthScale;
                         gFont->setSize(state->fFontSize);
                         gFontBold->setSize(state->fFontSize);
-                        handle_size_change(state, window, canvas, starImage, vte_ctx, screen, vte);
+                        handle_size_change(state, window, vte_ctx);
                         return;
                     } else if (key == SDLK_MINUS && (state->fFontSize - 1.0f) / state->fWidthScale >= 8.0) {
                         state->fFontSize -= 1.0 / state->fWidthScale;
                         gFont->setSize(state->fFontSize);
                         gFontBold->setSize(state->fFontSize);
-                        handle_size_change(state, window, canvas, starImage, vte_ctx, screen, vte);
+                        handle_size_change(state, window, vte_ctx);
                         return;
                     }
                 }
@@ -542,7 +565,7 @@ static void handle_sdl_events(ApplicationState* state, SDL_Window* window, SkCan
                 switch (event.window.event) {
                     case SDL_WINDOWEVENT_RESIZED:
                         // Use SDL_GL_GetDrawableSize to measure the layout change
-                        handle_size_change(state, window, canvas, starImage, vte_ctx, screen, vte);
+                        handle_size_change(state, window, vte_ctx);
                         break;
                     default:
                         SkDebugf("sdl: window event %d\n", event.window.event);
@@ -553,35 +576,29 @@ static void handle_sdl_events(ApplicationState* state, SDL_Window* window, SkCan
             case SDL_QUIT:
                 state->fQuit = true;
                 return;
-            case SDL_USEREVENT:
+            case REFRESH_EVENT:
 #if 0
                 SkDebugf("term_redraw queued\n");
 #endif
+                SkASSERT(event.user.code == 1);
                 state->fRedrawQueued = true;
                 ++*rotation;
                 break;
-            case SDL_USEREVENT + 1: {
+            case TTY_INPUT_EVENT: {
 #if 0
                 SkDebugf("io_event queued\n");
 #endif
-                long ret = -1;
-                char buf[DEFAULT_PIPE_BUFFER];
-                bool is_eof = false, should_retry = false;
-                Sint32 len = std::min<Sint32>(event.user.code, sizeof(buf));
-                ret = term_read_cb(vte, buf, len, &is_eof, &should_retry, vte_ctx);
-                if (ret > 0) {
+                char* buf = reinterpret_cast<char*>(event.user.data1);
+                Uint32 ret = static_cast<Sint32>(reinterpret_cast<uintptr_t>(event.user.data2));
+                SkASSERT(event.user.code == 1);
+                SkASSERT(ret > 0);
 #if 0
-                    SkDebugf("term_read_cb: %ld\n", ret);
+                SkDebugf("term_read_cb: %d\n", ret);
 #endif
-                    tsm_vte_input(vte, buf, ret);
-                    SkDebugf("term_redraw required\n");
-                    state->fRedrawRequired = true;
-                } else if (should_retry) {
-                    state->fShouldRetry = true;
-                } else if (ret < 0 || is_eof) {
-                    state->fQuit = true;
-                    return;
-                }
+                tsm_vte_input(vte, buf, ret);
+                delete []buf;
+                SkDebugf("term_redraw required\n");
+                state->fRedrawRequired = true;
                 break;
             }
             default:
@@ -684,21 +701,20 @@ HRESULT ReadFileN(HANDLE hFile, LPVOID lpBuffer, DWORD nNumberOfBytesToRead, LPD
 }
 
 // conpty: MakeNativeInterface
-static bool init_conpty(ApplicationState *state) {
-    sk_sp<WinListenContext> listen_ctx = sk_make_sp<WinListenContext>();
+static bool init_conpty(TsmVteCtx *vte_ctx, ApplicationState *state) {
+    sk_sp<OsListenContext> listen_ctx = sk_make_sp<OsListenContext>();
     HMODULE hLibrary = EnsureKernel32Loaded();
-    const auto fCreatePseudoConsole = (PFNCREATEPSEUDOCONSOLE)GetProcAddress(hLibrary, "CreatePseudoConsole");
+    const PFNCREATEPSEUDOCONSOLE fCreatePseudoConsole = (PFNCREATEPSEUDOCONSOLE)GetProcAddress(hLibrary, "CreatePseudoConsole");
     if (fCreatePseudoConsole == nullptr) {
         SkDebugf("conpty: CreatePseudoConsole not found\n");
         return false;
     }
-    const auto fResizePseudoConsole = (PFNRESIZEPSEUDOCONSOLE)GetProcAddress(hLibrary, "ResizePseudoConsole");
+    const PFNRESIZEPSEUDOCONSOLE fResizePseudoConsole = (PFNRESIZEPSEUDOCONSOLE)GetProcAddress(hLibrary, "ResizePseudoConsole");
     if (fResizePseudoConsole == nullptr) {
         SkDebugf("conpty: ResizePseudoConsole not found\n");
         return false;
     }
-    // Close ConPTY - this will terminate client process if running
-    const auto fClosePseudoConsole = (PFNCLOSEPSEUDOCONSOLE)GetProcAddress(hLibrary, "ClosePseudoConsole");
+    const PFNCLOSEPSEUDOCONSOLE fClosePseudoConsole = (PFNCLOSEPSEUDOCONSOLE)GetProcAddress(hLibrary, "ClosePseudoConsole");
     if (fClosePseudoConsole == nullptr) {
         SkDebugf("conpty: ClosePseudoConsole not found\n");
         return false;
@@ -706,7 +722,7 @@ static bool init_conpty(ApplicationState *state) {
     listen_ctx->fCreatePseudoConsole = fCreatePseudoConsole;
     listen_ctx->fResizePseudoConsole = fResizePseudoConsole;
     listen_ctx->fClosePseudoConsole = fClosePseudoConsole;
-    state->fListenCtx = listen_ctx;
+    vte_ctx->listen_ctx = listen_ctx;
     return true;
 }
 
@@ -716,10 +732,10 @@ static BOOL SKCreateNamedPipe(HANDLE *readSide, HANDLE *writeSide, DWORD process
     //
     //
     BOOL fSuccess;
-    OVERLAPPED ov;
     HANDLE handleArray[1];
     HANDLE hPipeServer, hPipeClient;
     HRESULT hr = S_OK;
+    OVERLAPPED ov;
     int lastError;
 
     char buffer[64];
@@ -797,12 +813,12 @@ static BOOL SKCreateNamedPipe(HANDLE *readSide, HANDLE *writeSide, DWORD process
 // conpty: MakeSurface
 static bool create_conpty(int ws_row, int ws_col, TsmVteCtx *vte_ctx, ApplicationState *state) {
     BOOL fSuccess;
-    HRESULT hr = S_OK;
+    COORD consize;
     HANDLE outPipeOurSide, inPipeOurSide;
     HANDLE outPipePseudoConsoleSide, inPipePseudoConsoleSide;
     HPCON hPC = 0;
-    COORD consize;
-    sk_sp<WinListenContext> listen_ctx = state->fListenCtx;
+    HRESULT hr = S_OK;
+    sk_sp<OsListenContext> listen_ctx = vte_ctx->listen_ctx;
     STARTUPINFOEXW startupInfoEx {};
     wchar_t expanded_commandline[MAX_PATH];
     const wchar_t *commandline = L"%WINDIR%\\system32\\cmd.exe";
@@ -875,8 +891,6 @@ static bool create_conpty(int ws_row, int ws_col, TsmVteCtx *vte_ctx, Applicatio
     listen_ctx->hPC = hPC;
     listen_ctx->hThread = process_information.hThread;
     listen_ctx->hProcess = process_information.hProcess;
-    vte_ctx->outPipeOurSide = outPipeOurSide;
-    vte_ctx->inPipeOurSide = inPipeOurSide;
 
     SkDebugf("CreateProcessW: process %lu\n", process_information.dwProcessId);
 
@@ -888,8 +902,8 @@ cleanup:
     return fSuccess;
 }
 
-static bool resize_conpty(int ws_row, int ws_col, TsmVteCtx */*ctx*/, ApplicationState *state) {
-    sk_sp<WinListenContext> listen_ctx = state->fListenCtx;
+static bool resize_conpty(int ws_row, int ws_col, TsmVteCtx *vte_ctx, ApplicationState *state) {
+    sk_sp<OsListenContext> listen_ctx = vte_ctx->listen_ctx;
     COORD consize;
     HRESULT hr = S_OK;
 
@@ -909,8 +923,8 @@ static bool resize_conpty(int ws_row, int ws_col, TsmVteCtx */*ctx*/, Applicatio
     return true;
 }
 
-static void close_conpty(TsmVteCtx */*ctx*/, ApplicationState *state) {
-    sk_sp<WinListenContext> listen_ctx = state->fListenCtx;
+static void close_conpty(TsmVteCtx *vte_ctx, ApplicationState *state) {
+    sk_sp<OsListenContext> listen_ctx = vte_ctx->listen_ctx;
 
     // Close ConPTY - this will terminate client process if running
     listen_ctx->fClosePseudoConsole(listen_ctx->hPC);
@@ -922,23 +936,39 @@ static void close_conpty(TsmVteCtx */*ctx*/, ApplicationState *state) {
     ::TerminateProcess(listen_ctx->hProcess, /*uExitCode*/ ~0u);
 }
 
-static void fini_conpty(ApplicationState *state) {
-    sk_sp<WinListenContext> listen_ctx = state->fListenCtx;
+static void fini_conpty(TsmVteCtx *vte_ctx, ApplicationState *state) {
+    sk_sp<OsListenContext> listen_ctx = vte_ctx->listen_ctx;
 
     // Now safe to clean-up client app's process-info & thread
     ::CloseHandle(listen_ctx->hThread);
     ::CloseHandle(listen_ctx->hProcess);
+
+    vte_ctx->listen_ctx.reset();
+
+    // Destroy vte object
+    if (vte_ctx->vte) {
+        tsm_vte_unref(vte_ctx->vte);
+    }
+
+    // Destroy Screen Object
+    if (vte_ctx->screen) {
+        tsm_screen_unref(vte_ctx->screen);
+    }
 }
 #else
 // MakeNativeInterface
-static bool init_conpty(ApplicationState *state) {
+static bool init_conpty(TsmVteCtx *vte_ctx, ApplicationState *state) {
+    sk_sp<OsListenContext> listen_ctx = sk_make_sp<OsListenContext>();
+    vte_ctx->listen_ctx = listen_ctx;
     return true;
 }
 
-static bool create_conpty(int ws_row, int ws_col, TsmVteCtx *ctx, ApplicationState *state) {
-    int *fd = &ctx->fd;
+static bool create_conpty(int ws_row, int ws_col, TsmVteCtx *vte_ctx, ApplicationState *state) {
+    int fd;
     struct termios term;
     struct winsize ws;
+    sk_sp<OsListenContext> listen_ctx = vte_ctx->listen_ctx;
+
     memset(&term, 0, sizeof(term));
     memset(&ws, 0, sizeof(ws));
 
@@ -979,7 +1009,7 @@ static bool create_conpty(int ws_row, int ws_col, TsmVteCtx *ctx, ApplicationSta
     ws.ws_col = ws_row;
 
     // Using the same way just like Terminal.app
-    pid_t pid = ::forkpty(fd, nullptr, &term, &ws);
+    pid_t pid = ::forkpty(&fd, nullptr, &term, &ws);
     if (pid == 0) {
         ::setenv("TERM", "xterm-256color", 1);
         const char* childArgv[] = {"/bin/bash", "-la", nullptr};
@@ -996,10 +1026,11 @@ static bool create_conpty(int ws_row, int ws_col, TsmVteCtx *ctx, ApplicationSta
 
     SkDebugf("forkpty: pid %d\n", pid);
 
-    state->fPid = pid;
+    listen_ctx->pid = pid;
+    listen_ctx->fd = fd;
 
 #if 0
-    int ret = fcntl(*fd, F_SETFL, O_NONBLOCK | fcntl(*fd, F_GETFL));
+    int ret = fcntl(fd, F_SETFL, O_NONBLOCK | fcntl(*fd, F_GETFL));
     if (ret < 0) {
         errno_t cerrno = errno;
         SkDebugf("fcntl: O_NONBLOCK %s\n",
@@ -1007,7 +1038,7 @@ static bool create_conpty(int ws_row, int ws_col, TsmVteCtx *ctx, ApplicationSta
     }
 #else
     int arg = 1;
-    int ret = ioctl(*fd, FIONBIO, &arg);
+    int ret = ioctl(fd, FIONBIO, &arg);
     if (ret < 0) {
         errno_t cerrno = errno;
         SkDebugf("ioctl: FIONBIO %s\n",
@@ -1018,8 +1049,9 @@ static bool create_conpty(int ws_row, int ws_col, TsmVteCtx *ctx, ApplicationSta
     return true;
 }
 
-static bool resize_conpty(int ws_row, int ws_col, TsmVteCtx *ctx, ApplicationState *state) {
-    int fd = ctx->fd;
+static bool resize_conpty(int ws_row, int ws_col, TsmVteCtx *vte_ctx, ApplicationState *state) {
+    sk_sp<OsListenContext> listen_ctx = vte_ctx->listen_ctx;
+    int fd = listen_ctx->fd;
     struct winsize ws;
     memset(&ws, 0, sizeof(ws));
 
@@ -1036,9 +1068,10 @@ static bool resize_conpty(int ws_row, int ws_col, TsmVteCtx *ctx, ApplicationSta
     return true;
 }
 
-static void close_conpty(TsmVteCtx *ctx, ApplicationState *state) {
-    int fd = ctx->fd;
-    pid_t pid = state->fPid;
+static void close_conpty(TsmVteCtx *vte_ctx, ApplicationState *state) {
+    sk_sp<OsListenContext> listen_ctx = vte_ctx->listen_ctx;
+    int fd = listen_ctx->fd;
+    pid_t pid = listen_ctx->pid;
     int ret;
 
     // Clean-up the pipes
@@ -1070,9 +1103,20 @@ static void close_conpty(TsmVteCtx *ctx, ApplicationState *state) {
     }
 }
 
-static void fini_conpty(ApplicationState *state) {
+static void fini_conpty(TsmVteCtx *vte_ctx, ApplicationState *state) {
     // Now safe to clean-up client app's process-info & thread
+    static_cast<void>(vte_ctx);
     static_cast<void>(state);
+
+    // Destroy vte object
+    if (vte_ctx->vte) {
+        tsm_vte_unref(vte_ctx->vte);
+    }
+
+    // Destroy Screen Object
+    if (vte_ctx->screen) {
+        tsm_screen_unref(vte_ctx->screen);
+    }
 }
 #endif
 
@@ -1110,8 +1154,10 @@ void log_tsm(void* data, const char* file, int line, const char* fn,
 
 #if defined(SK_BUILD_FOR_WIN)
 static void term_write_cb(struct tsm_vte* vte, const char* u8, size_t len, void* data) {
-    auto state = reinterpret_cast<TsmVteCtx*>(data)->state;
-    HANDLE inPipeOurSide = reinterpret_cast<TsmVteCtx*>(data)->inPipeOurSide;
+    sk_sp<OsListenContext> listen_ctx = reinterpret_cast<TsmVteCtx*>(data)->listen_ctx;
+    ApplicationState *state = reinterpret_cast<TsmVteCtx*>(data)->state;
+
+    HANDLE inPipeOurSide = listen_ctx->inPipeOurSide;
     DWORD dwBytesWritten{};
     HRESULT hr;
 
@@ -1129,7 +1175,9 @@ static void term_write_cb(struct tsm_vte* vte, const char* u8, size_t len, void*
 }
 static long term_read_cb(struct tsm_vte* vte, char* u8, size_t len, bool *is_eof,
                          bool *should_retry, TsmVteCtx *vte_ctx) {
-    HANDLE outPipeOurSide = vte_ctx->outPipeOurSide;
+    sk_sp<OsListenContext> listen_ctx = vte_ctx->listen_ctx;
+
+    HANDLE outPipeOurSide = listen_ctx->outPipeOurSide;
     DWORD dwBytesRead{};
     HRESULT hr;
 
@@ -1161,9 +1209,12 @@ static long term_read_cb(struct tsm_vte* vte, char* u8, size_t len, bool *is_eof
 }
 #else
 static void term_write_cb(struct tsm_vte* vte, const char* u8, size_t len, void* data) {
-    auto state = reinterpret_cast<TsmVteCtx*>(data)->state;
-    int fd = reinterpret_cast<TsmVteCtx*>(data)->fd;
+    sk_sp<OsListenContext> listen_ctx = reinterpret_cast<TsmVteCtx*>(data)->listen_ctx;
+    ApplicationState *state = reinterpret_cast<TsmVteCtx*>(data)->state;
+
+    int fd = listen_ctx->fd;
     int send_len;
+
     do {
       send_len = write(fd, u8, len);
       if (send_len < 0 && errno == EINTR) {
@@ -1184,9 +1235,11 @@ static void term_write_cb(struct tsm_vte* vte, const char* u8, size_t len, void*
     }
 }
 
-static long term_read_cb(struct tsm_vte* vte, char* u8, size_t len, bool *is_eof,
+static long term_read_cb(struct tsm_vte *vte, char* u8, size_t len, bool *is_eof,
                          bool *should_retry, TsmVteCtx *vte_ctx) {
-    int fd = vte_ctx->fd;
+    sk_sp<OsListenContext> listen_ctx = vte_ctx->listen_ctx;
+
+    int fd = listen_ctx->fd;
     long ret;
     do {
       ret = read(fd, u8, len);
@@ -1323,13 +1376,13 @@ static VTE_COLOR_palette_t VTE_COLOR_palette_solarized_white = {
 
 static VTE_COLOR_palette_t *VTE_COLOR_palette_in_runtime = &VTE_COLOR_palette;
 
-enum vte_color_palette_t {
+enum tsm_vte_color_palette_t {
   t_vte_color_palette = 0x0,
   t_vte_color_palette_solarized,
   t_vte_color_palette_solarized_black,
   t_vte_color_palette_solarized_white,
 };
-static void vte_color_palette_set_type(vte_color_palette_t t) {
+static void tsm_vte_color_palette_set_type(tsm_vte_color_palette_t t) {
   switch(t) {
     default:
     case t_vte_color_palette:
@@ -1504,7 +1557,7 @@ static sk_sp<SkImage> draw_star_image(SkCanvas *canvas, float r) {
 
     SkCanvas* offscreen = cpuSurface->getCanvas();
     offscreen->save();
-    paint.setColor(SkColorSetARGB(0xff, 7, 54, 66));
+    paint.setColor(term_get_default_bc());
     offscreen->translate(r, r);
     offscreen->drawPath(create_star(r), paint);
     offscreen->restore();
@@ -1623,6 +1676,240 @@ static HRESULT retrieveDPI(SkDPI *dpi, RECT *rect)
 }
 #endif /* SK_BUILD_FOR_WIN */
 
+static int mthread_routine(void *data) {
+    sk_sp<OsListenContext> listen_ctx = reinterpret_cast<TsmVteCtx*>(data)->listen_ctx;
+    ApplicationState *state = reinterpret_cast<TsmVteCtx*>(data)->state;
+    SkDebugf("monitor thread began\n");
+#if defined(SK_BUILD_FOR_WIN)
+    HRESULT hr = S_OK;
+    HANDLE hProcess = listen_ctx->hProcess;
+    DWORD processId = ::GetProcessId(hProcess);
+    DWORD exitCode = ~0;
+
+    DWORD ret = ::WaitForSingleObject(hProcess, INFINITE);
+    switch (ret) {
+        case WAIT_OBJECT_0:
+            break;
+        case WAIT_FAILED:
+        default:
+            hr = HRESULT_FROM_WIN32(GetLastError());
+            SkDebugf("WaitForSingleObject(): error %s\n",
+                     std::system_category().message(hr).c_str());
+            break;
+    }
+    if (SUCCEEDED(hr)) {
+        if (::GetExitCodeProcess(hProcess, &exitCode)) {
+            SkDebugf("GetExitCodeProcess: process %lu exited code %lu\n", processId, exitCode);
+        } else {
+            hr = HRESULT_FROM_WIN32(GetLastError());
+            SkDebugf("GetExitCodeProcess(): process %lu error %s\n", processId,
+                     std::system_category().message(hr).c_str());
+        }
+    }
+#else
+    pid_t pid = listen_ctx->pid;
+    int ret;
+    int wstatus, exitCode = -1;
+    ret = waitpid(pid, &wstatus, 0);
+    if (ret >= 0) {
+        exitCode = ret = WEXITSTATUS(wstatus);
+        SkDebugf("waitpid: pid %d exited code %d\n", pid, ret);
+    } else {
+        errno_t cerrno = errno;
+        SkDebugf("waitpid: pid %d %s\n", pid,
+                 std::system_category().message(cerrno).c_str());
+    }
+#endif
+
+    SkDebugf("monitor thread exited\n");
+    state->fQuit = true;
+    return exitCode;
+}
+
+static int rnthread_routine(void *data) {
+    ApplicationState *state = reinterpret_cast<TsmVteCtx*>(data)->state;
+    SkDebugf("redraw-notification thread began\n");
+    while (!state->fQuit) {  // Our VSync loop
+        SDL_Event user_event;
+        SDL_zero(user_event); // Initialize the event structure
+        user_event.type = REFRESH_EVENT; // Custom event type
+        user_event.user.code = 1; // Custom code
+        user_event.user.data1 = NULL;
+        user_event.user.data2 = NULL;
+
+        SDL_PushEvent(&user_event);
+
+        SDL_Delay(1000.0f / state->fDm.refresh_rate * 5.0);
+    }
+    SkDebugf("redraw-notification thread exited\n");
+    return 0;
+}
+
+static int tnthread_routine(void *data) {
+    TsmVteCtx *vte_ctx = reinterpret_cast<TsmVteCtx*>(data);
+    sk_sp<OsListenContext> listen_ctx = reinterpret_cast<TsmVteCtx*>(data)->listen_ctx;
+    ApplicationState *state = vte_ctx->state;
+    int result = 0;
+    SkDebugf("term-notification thread began\n");
+#if defined(SK_BUILD_FOR_WIN)
+    HANDLE outPipeOurSide = listen_ctx->outPipeOurSide;
+    DWORD dwBytesRead{};
+    HRESULT hr;
+    while (!state->fQuit) {  // Our I/O loop
+        BOOL fSuccess = ::PeekNamedPipe(outPipeOurSide, NULL, 0, NULL, &dwBytesRead, NULL);
+        if (!fSuccess) {
+            hr = HRESULT_FROM_WIN32(GetLastError());
+            SkDebugf("PeekNamedPipe: %s\n",
+                     std::system_category().message(hr).c_str());
+            result = -1;
+            state->fQuit = true;
+            break;
+        } else if (dwBytesRead == 0) {
+            SDL_Delay(10.0f + 2);
+            continue;
+        }
+
+        Sint32 ret;
+        char *buf = new char[dwBytesRead];
+        bool is_eof = false, should_retry = false;
+        Uint32 len = dwBytesRead;
+        if (!buf) {
+            SkDebugf("OOM\n");
+            result = -1;
+            state->fQuit = true;
+            break;
+        }
+        ret = term_read_cb(vte_ctx->vte, buf, len, &is_eof, &should_retry, vte_ctx);
+        if (should_retry) {
+            continue;
+        }
+        if (is_eof || ret < 0) {
+            result = -1;
+            state->fQuit = true;
+            break;
+        }
+
+        SDL_Event user_event;
+        SDL_zero(user_event); // Initialize the event structure
+        user_event.type = TTY_INPUT_EVENT; // Custom event type
+        user_event.user.code = 1; // Custom code
+        user_event.user.data1 = buf;
+        user_event.user.data2 = reinterpret_cast<void*>(static_cast<UINT_PTR>(ret));
+
+        SDL_PushEvent(&user_event);
+    }
+#else
+#if 1
+    int fd = listen_ctx->fd;
+    int maxfd = fd;
+    fd_set rfds;
+    while (!state->fQuit) {  // Our I/O loop
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+        int ret = ::select(maxfd + 1, &rfds, NULL, NULL, NULL);
+        if (ret == -1) {
+            errno_t cerrno = errno;
+            SkDebugf("select: %s\n",
+                     std::system_category().message(cerrno).c_str());
+            result = -1;
+            state->fQuit = true;
+            break;
+        } else if (ret == 0) {
+            SDL_Delay(10.0f + 2);
+            continue;
+        }
+        SkASSERT(FD_ISSET(fd, &rfds));
+
+        char *buf = new char[DEFAULT_PIPE_BUFFER];
+        bool is_eof = false, should_retry = false;
+        Uint32 len = DEFAULT_PIPE_BUFFER;
+        if (!buf) {
+            SkDebugf("OOM\n");
+            result = -1;
+            state->fQuit = true;
+            break;
+        }
+        ret = term_read_cb(vte_ctx->vte, buf, len, &is_eof, &should_retry, vte_ctx);
+        if (should_retry) {
+            continue;
+        }
+        if (is_eof || ret < 0) {
+            result = -1;
+            state->fQuit = true;
+            break;
+        }
+
+        SDL_Event user_event;
+        SDL_zero(user_event); // Initialize the event structure
+        user_event.type = TTY_INPUT_EVENT; // Custom event type
+        user_event.user.code = 1; // Custom code
+        user_event.user.data1 = buf;
+        user_event.user.data2 = reinterpret_cast<void*>(static_cast<uintptr_t>(ret));
+
+        SDL_PushEvent(&user_event);
+    }
+#else
+    int fd = listen_ctx->fd;
+    while (!state->fQuit) {  // Our I/O loop
+        int bytes;
+        int ret = ioctl(fd, FIONREAD, &bytes);
+        if (ret == -1) {
+            errno_t cerrno = errno;
+            SkDebugf("ioctl: FIONREAD %s\n",
+                     std::system_category().message(cerrno).c_str());
+            result = -1;
+            state->fQuit = true;
+            break;
+        } else if (bytes == 0) {
+            SDL_Delay(10.0f + 2);
+            continue;
+        }
+
+        char *buf = new char[DEFAULT_PIPE_BUFFER];
+        bool is_eof = false, should_retry = false;
+        Uint32 len = DEFAULT_PIPE_BUFFER;
+        if (!buf) {
+            SkDebugf("OOM\n");
+            result = -1;
+            state->fQuit = true;
+            break;
+        }
+        ret = term_read_cb(vte_ctx->vte, buf, len, &is_eof, &should_retry, vte_ctx);
+        if (should_retry) {
+            continue;
+        }
+        if (is_eof || ret < 0) {
+            result = -1;
+            state->fQuit = true;
+            break;
+        }
+
+        SDL_Event user_event;
+        SDL_zero(user_event); // Initialize the event structure
+        user_event.type = TTY_INPUT_EVENT; // Custom event type
+        user_event.user.code = 1; // Custom code
+        user_event.user.data1 = buf;
+        user_event.user.data2 = reinterpret_cast<void*>(static_cast<uintptr_t>(ret));
+
+        SDL_PushEvent(&user_event);
+    }
+#endif
+#endif
+    SkDebugf("term-notification thread exited\n");
+    return result;
+}
+
+static ApplicationState *gState = NULL;
+
+static void signal_handler(int sig) {
+    if (sig == SIGINT) {
+        gState->fQuit = true;
+    }
+    if (sig == SIGTERM) {
+        gState->fQuit = true;
+    }
+};
+
 #if defined(SK_BUILD_FOR_ANDROID) || defined(SK_BUILD_FOR_WIN)
 int SDL_main(int argc, char** argv) {
 #else
@@ -1643,16 +1930,15 @@ int main(int argc, char** argv) {
     // and linking "Shcore.lib" to your project.
     // Note that this call must be the first Window management-related call in your program,
     // so you should probably call this at the very top of your main.
+    HRESULT hr = S_OK;
 #if 1
-    HRESULT hr = ::SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE);
+    hr = ::SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE);
     if (FAILED(hr)) {
         SkDebugf("SetProcessDpiAwareness(): %s\n",
                  std::system_category().message(hr).c_str());
     }
 #else
-    BOOL result = ::SetProcessDPIAware();
-    HRESULT hr = S_OK;
-    if (!result) {
+    if (!::SetProcessDPIAware()) {
         hr = HRESULT_FROM_WIN32(GetLastError());
         SkDebugf("SetProcessDpiAware(): %s\n",
                  std::system_category().message(hr).c_str());
@@ -1670,26 +1956,18 @@ int main(int argc, char** argv) {
     SkDebugf("sdl video driver: %s\n", SDL_GetCurrentVideoDriver());
 
     ApplicationState state {};
-    static ApplicationState *gState = &state;
+    gState = &state;
 
     // embraces interrupt signal
-    auto signal_handler = [](int sig) {
-        if (sig == SIGINT) {
-            gState->fQuit = true;
-        }
-        if (sig == SIGTERM) {
-            gState->fQuit = true;
-        }
-    };
     if (signal(SIGINT, signal_handler) != 0) {
-        SkDebugf("SIGINT handler was not enabled.");
+        SkDebugf("SIGINT handler was not properly enabled.");
     }
     if (signal(SIGTERM, signal_handler) != 0) {
-        SkDebugf("SIGTERM handler was not enabled.");
+        SkDebugf("SIGTERM handler was not properly enabled.");
     }
-#ifndef SK_BUILD_FOR_WIN
+#if !defined(SK_BUILD_FOR_WIN)
     if (signal(SIGPIPE, SIG_IGN) != 0) {
-        SkDebugf("SIGPIPE handler was not disabled properly.");
+        SkDebugf("SIGPIPE handler was not properly disabled.");
     }
 #endif
 
@@ -1832,7 +2110,7 @@ int main(int argc, char** argv) {
 #endif
 
 #if 0
-    auto pfnGlGetString = (decltype(&glGetString))SDL_GL_GetProcAddress("glGetString");
+    decltype(&glGetString) pfnGlGetString = (decltype(&glGetString))SDL_GL_GetProcAddress("glGetString");
     const char* vendorStr = reinterpret_cast<const char*>(pfnGlGetString(GR_GL_VENDOR));
     SkDebugf("Current GL Vendor: %s\n", vendorStr);
     const char* renderStr = reinterpret_cast<const char*>(pfnGlGetString(GR_GL_RENDERER));
@@ -1904,34 +2182,29 @@ int main(int argc, char** argv) {
     GLState _glState;
     glState = &_glState;
 
-    auto canvas = glGetCanvas(dw, dh, windowFormat, contextType, state.fWidthScale, state.fHeightScale);
+    SkCanvas *canvas = glGetCanvas(dw, dh, windowFormat, contextType, state.fWidthScale, state.fHeightScale);
     if (!canvas) {
+        SkDebugf("FATAL: gl state unavailable\n");
         return -1;
     }
 
-    sk_sp<SkImage> starImage = draw_star_image(canvas, DEFAULT_STAR_RADIUS);
-
-#ifdef SK_BUILD_FOR_WIN
-    TsmVteCtx vte_ctx { &state, INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE };
-#else
-    TsmVteCtx vte_ctx { &state, -1 };
-#endif
+    TsmVteCtx tsm_vte_ctx { &state, NULL, NULL, {} };
 
     int ws_row = std::floorf((float)(state.fDm.w) / state.fFontAdvanceWidth);
     int ws_col = std::floorf((float)(state.fDm.h - state.fFontSpacing) / (state.fFontSize + state.fFontSpacing));
 
-#ifdef SK_BUILD_FOR_WIN
+#if defined(SK_BUILD_FOR_WIN)
     update_window_title(window, "cmd.exe", ws_row, ws_col);
 #else
     update_window_title(window, "bash", ws_row, ws_col);
 #endif
 
     SkDebugf("init: row %d col %d\n", ws_row, ws_col);
-    if (!init_conpty(&state)) {
+    if (!init_conpty(&tsm_vte_ctx, &state)) {
         SkDebugf("init: failed to initialize conpty\n");
         return -1;
     }
-    if (!create_conpty(ws_row, ws_col, &vte_ctx, &state)) {
+    if (!create_conpty(ws_row, ws_col, &tsm_vte_ctx, &state)) {
         SkDebugf("init: failed to create conpty\n");
         return -1;
     }
@@ -1939,192 +2212,37 @@ int main(int argc, char** argv) {
     state.fCol = ws_col;
 
     // create a software-based virtual terminal
-    struct tsm_screen* screen = NULL;
-    struct tsm_vte* vte = NULL;
-
-    tsm_screen_new(&screen, log_tsm, screen);
+    if (tsm_screen_new(&tsm_vte_ctx.screen, log_tsm, NULL) != 0) {
+        SkDebugf("tsm_screen_new failed\n");
+        return -1;
+    }
     // increases scrollback size to 500k lines
-    tsm_screen_set_max_sb(screen, 500000);
-    tsm_screen_resize(screen, ws_row, ws_col);
+    tsm_screen_set_max_sb(tsm_vte_ctx.screen, 500000);
+    tsm_screen_resize(tsm_vte_ctx.screen, ws_row, ws_col);
 
-    tsm_vte_new(&vte, screen, term_write_cb, &vte_ctx, log_tsm, screen);
-    vte_color_palette_set_type(t_vte_color_palette_solarized_white);
+    if (tsm_vte_new(&tsm_vte_ctx.vte, tsm_vte_ctx.screen, term_write_cb, &tsm_vte_ctx, log_tsm, NULL) != 0) {
+        SkDebugf("tsm_vte_new failed\n");
+        return -1;
+    }
+    tsm_vte_color_palette_set_type(t_vte_color_palette_solarized_white);
 
     int rotation = 0;
+    SDL_Thread *monitor_thread, *redraw_notify_thread, *term_notify_thread;
 
-    state.fMonitorThread = SDL_CreateThread([](void *data) -> int {
-        auto state = reinterpret_cast<TsmVteCtx*>(data)->state;
-        SkDebugf("monitor thread began\n");
-#ifdef SK_BUILD_FOR_WIN
-        HRESULT hr = S_OK;
-        HANDLE hProcess = state->fListenCtx->hProcess;
-        DWORD processId = ::GetProcessId(hProcess);
-        DWORD exitCode = ~0;
-
-        DWORD ret = ::WaitForSingleObject(hProcess, INFINITE);
-        switch (ret) {
-            case WAIT_OBJECT_0:
-                break;
-            case WAIT_FAILED:
-            default:
-                hr = HRESULT_FROM_WIN32(GetLastError());
-                SkDebugf("WaitForSingleObject(): error %s\n",
-                         std::system_category().message(hr).c_str());
-                break;
-        }
-        if (SUCCEEDED(hr)) {
-            if (::GetExitCodeProcess(hProcess, &exitCode)) {
-                SkDebugf("GetExitCodeProcess: process %lu exited code %lu\n", processId, exitCode);
-            } else {
-                hr = HRESULT_FROM_WIN32(GetLastError());
-                SkDebugf("GetExitCodeProcess(): process %lu error %s\n", processId,
-                         std::system_category().message(hr).c_str());
-            }
-        }
-#else
-        pid_t pid = state->fPid;
-        int ret;
-        int wstatus, exitCode = -1;
-        ret = waitpid(pid, &wstatus, 0);
-        if (ret >= 0) {
-            exitCode = ret = WEXITSTATUS(wstatus);
-            SkDebugf("waitpid: pid %d exited code %d\n", pid, ret);
-        } else {
-            errno_t cerrno = errno;
-            SkDebugf("waitpid: pid %d %s\n", pid,
-                     std::system_category().message(cerrno).c_str());
-        }
-#endif
-
-        SkDebugf("monitor thread exited\n");
-        state->fQuit = true;
-        return exitCode;
-    }, "monitor", &vte_ctx);
-    if (!state.fMonitorThread) {
+    monitor_thread = SDL_CreateThread(mthread_routine, "monitor thread", &tsm_vte_ctx);
+    if (!monitor_thread) {
         handle_sdl_error();
         return 1;
     }
 
-    state.fRedrawNotificationThread = SDL_CreateThread([](void *data) -> int {
-        auto state = reinterpret_cast<TsmVteCtx*>(data)->state;
-        SkDebugf("redraw-notification thread began\n");
-        while (!state->fQuit) {  // Our VSync loop
-            SDL_Event user_event;
-            SDL_zero(user_event); // Initialize the event structure
-            user_event.type = SDL_USEREVENT; // Custom event type
-            user_event.user.code = 1; // Custom code
-            user_event.user.data1 = NULL;
-            user_event.user.data2 = NULL;
-
-            SDL_PushEvent(&user_event);
-
-            SDL_Delay(1000.0f / state->fDm.refresh_rate);
-        };
-        SkDebugf("redraw-notification thread exited\n");
-        return 0;
-    }, "redraw-notification", &vte_ctx);
-    if (!state.fRedrawNotificationThread) {
+    redraw_notify_thread = SDL_CreateThread(rnthread_routine, "redraw-notification thread", &tsm_vte_ctx);
+    if (!redraw_notify_thread) {
         handle_sdl_error();
         return 1;
     }
 
-    state.fTermNotificationThread = SDL_CreateThread([](void *data) -> int {
-        auto state = reinterpret_cast<TsmVteCtx*>(data)->state;
-        int result = 0;
-        SkDebugf("term-notification thread began\n");
-#ifdef SK_BUILD_FOR_WIN
-        HANDLE outPipeOurSide = reinterpret_cast<TsmVteCtx*>(data)->outPipeOurSide;
-        DWORD dwBytesRead{};
-        HRESULT hr;
-        while (!state->fQuit) {  // Our I/O loop
-            BOOL fSuccess = ::PeekNamedPipe(outPipeOurSide, NULL, 0, NULL, &dwBytesRead, NULL);
-            if (!fSuccess) {
-                hr = HRESULT_FROM_WIN32(GetLastError());
-                SkDebugf("PeekNamedPipe: %s\n",
-                         std::system_category().message(hr).c_str());
-                result = -1;
-                break;
-            } else if (dwBytesRead == 0) {
-                SDL_Delay(10.0f + 2);
-                continue;
-            }
-
-            SDL_Event user_event;
-            SDL_zero(user_event); // Initialize the event structure
-            user_event.type = SDL_USEREVENT + 1; // Custom event type
-            user_event.user.code = dwBytesRead; // Custom code
-            user_event.user.data1 = NULL;
-            user_event.user.data2 = NULL;
-
-            SDL_PushEvent(&user_event);
-
-            SDL_Delay(10.0f + 2);
-        };
-#else
-#if 1
-        int fd = reinterpret_cast<TsmVteCtx*>(data)->fd;
-        int maxfd = fd;
-        fd_set rfds;
-        while (!state->fQuit) {  // Our I/O loop
-            FD_ZERO(&rfds);
-            FD_SET(fd, &rfds);
-            int ret = ::select(maxfd + 1, &rfds, NULL, NULL, NULL);
-            if (ret == -1) {
-                errno_t cerrno = errno;
-                SkDebugf("select: %s\n",
-                         std::system_category().message(cerrno).c_str());
-                result = -1;
-                break;
-            } else if (ret == 0) {
-                SDL_Delay(10.0f + 2);
-                continue;
-            }
-            SkASSERT(FD_ISSET(fd, &rfds));
-
-            SDL_Event user_event;
-            SDL_zero(user_event); // Initialize the event structure
-            user_event.type = SDL_USEREVENT + 1; // Custom event type
-            user_event.user.code = DEFAULT_PIPE_BUFFER; // Custom code
-            user_event.user.data1 = NULL;
-            user_event.user.data2 = NULL;
-
-            SDL_PushEvent(&user_event);
-
-            SDL_Delay(10.0f + 2);
-        }
-#else
-        int fd = reinterpret_cast<TsmVteCtx*>(data)->fd;
-        while (!state->fQuit) {  // Our I/O loop
-            int bytes;
-            int ret = ioctl(fd, FIONREAD, &bytes);
-            if (ret == -1) {
-                errno_t cerrno = errno
-                SkDebugf("ioctl: FIONREAD %s\n",
-                         std::system_category().message(cerrno).c_str());
-                result = -1;
-                break;
-            } else if (bytes == 0) {
-                SDL_Delay(10.0f + 2);
-                continue;
-            }
-
-            SDL_Event user_event;
-            SDL_zero(user_event); // Initialize the event structure
-            user_event.type = SDL_USEREVENT + 1; // Custom event type
-            user_event.user.code = bytes; // Custom code
-            user_event.user.data1 = NULL;
-            user_event.user.data2 = NULL;
-
-            SDL_PushEvent(&user_event);
-
-            SDL_Delay(10.0f + 2);
-        };
-#endif
-#endif
-        SkDebugf("term-notification thread exited\n");
-        return result;
-    }, "term-notification", &vte_ctx);
-    if (!state.fTermNotificationThread) {
+    term_notify_thread = SDL_CreateThread(tnthread_routine, "term-notification thread", &tsm_vte_ctx);
+    if (!term_notify_thread) {
         handle_sdl_error();
         return 1;
     }
@@ -2134,7 +2252,7 @@ int main(int argc, char** argv) {
         state.fShouldRetry = false;
 
         canvas->clear(term_get_default_bc());
-        handle_sdl_events(&state, window, &canvas, &starImage, &rotation, &vte_ctx, screen, vte);
+        handle_sdl_events(&state, window, &rotation, &tsm_vte_ctx);
         if (state.fQuit) {
             break;
         }
@@ -2160,17 +2278,18 @@ should_retry:
 
 redraw_queued:
         state.fRedrawQueued = false;
+        canvas = glState->canvas;
 
         // pass 1: draw terminal canvas
         canvas->save();
-        draw_vte_screen(canvas, &state, vte, screen);
+        draw_vte_screen(canvas, &state, tsm_vte_ctx.vte, tsm_vte_ctx.screen);
         canvas->restore();
 
         // pass 2: draw star canvas from offline canvas
         canvas->save();
         canvas->translate(state.fDm.w / 2.0 , state.fDm.h / 2.0);
         canvas->rotate(rotation);
-        canvas->drawImage(starImage, -DEFAULT_STAR_RADIUS, -DEFAULT_STAR_RADIUS);
+        canvas->drawImage(glState->starImage, -DEFAULT_STAR_RADIUS, -DEFAULT_STAR_RADIUS);
         canvas->restore();
 
         auto dContext = GrAsDirectContext(canvas->recordingContext());
@@ -2179,23 +2298,13 @@ redraw_queued:
         SDL_GL_SwapWindow(window);
     }
 
-    close_conpty(&vte_ctx, &state);
+    close_conpty(&tsm_vte_ctx, &state);
 
-    SDL_WaitThread(state.fRedrawNotificationThread, NULL);
-    SDL_WaitThread(state.fTermNotificationThread, NULL);
-    SDL_WaitThread(state.fMonitorThread, NULL);
+    SDL_WaitThread(redraw_notify_thread, NULL);
+    SDL_WaitThread(term_notify_thread, NULL);
+    SDL_WaitThread(monitor_thread, NULL);
 
-    fini_conpty(&state);
-
-    // Destroy vte object
-    if (vte) {
-        tsm_vte_unref(vte);
-    }
-
-    // Destroy Screen Object
-    if (screen) {
-        tsm_screen_unref(screen);
-    }
+    fini_conpty(&tsm_vte_ctx, &state);
 
 #if 1
     // Destory glContext
