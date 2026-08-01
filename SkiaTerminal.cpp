@@ -103,6 +103,14 @@ extern char **environ;
 
 #define DEFAULT_PIPE_BUFFER 4096
 
+/*
+ * This demo is a not-too-simple application of what to do with Skia it handles:
+ *   how to draw 16-bit colored text including background
+ *   how to adjust internal memory layout according to window resize callback from Os' side
+ *   work out software-emulated virtual terminal (vte) in real world (at least the editor used to create this software)
+ *   work out creation and destroy of Os' window (likely hiDPI) and OpenGL context (likely software-emulated)
+ *   work out font anti-alias in real world (especially for non-emoji cases)
+ */
 #ifdef SK_BUILD_FOR_WIN
 typedef std::pair<int, int> SkDPI;
 static HRESULT retrieveDPI(SkDPI *dpi, RECT *rect = nullptr);
@@ -116,7 +124,7 @@ struct TsmVteCtx;
 
 static bool resize_conpty(int ws_row, int ws_col, TsmVteCtx *ctx, ApplicationState *state);
 
-static void update_window_title(SDL_Window *window, const char* name, int ws_row, int ws_col) {
+static void update_window_title(const char* name, int ws_row, int ws_col, SDL_Window *window) {
     char buffer[64];
     int len = snprintf(buffer, sizeof(buffer), "SkTerminal - %s - %dx%d", name, ws_row, ws_col);
     char* stop = buffer + len;
@@ -175,7 +183,12 @@ struct TsmVteCtx {
 };
 
 
-struct GLState {
+struct GrGLState {
+    sk_sp<SkTypeface> typeface;
+    std::unique_ptr<SkFont> font;
+    sk_sp<SkTypeface> typefaceBold;
+    std::unique_ptr<SkFont> fontBold;
+
     sk_sp<const GrGLInterface> glInterface;
     sk_sp<GrDirectContext> grContext;
     sk_sp<SkSurface> surface;
@@ -190,13 +203,12 @@ static void handle_sdl_error() {
     SDL_ClearError();
 }
 
-static SkFont *gFont, *gFontBold;
-static GLState *glState;
-
 static sk_sp<SkImage> draw_star_image(SkCanvas *canvas, float r);
 
-static SkCanvas* glGetCanvas(int dw, int dh, uint32_t windowFormat, int contextType,
-                             double widthScale, double heightScale) {
+static SkCanvas* GrGLGetCanvas(ApplicationState *state, uint32_t windowFormat, int contextType, GrGLState *glState) {
+    int dw = state->fDw, dh = state->fDh;
+    double widthScale = state->fWidthScale, heightScale = state->fHeightScale;
+
 #if defined(SK_BUILD_FOR_WIN) && defined(SK_ANGLE)
     // setup GrContext
     glState->glInterface = GrGLMakeEGLInterface();
@@ -308,7 +320,7 @@ static SkCanvas* glGetCanvas(int dw, int dh, uint32_t windowFormat, int contextT
     return canvas;
 }
 
-static void handle_size_change(ApplicationState *state, SDL_Window *window, TsmVteCtx *vte_ctx) {
+static void handle_size_change(ApplicationState *state, GrGLState *glState, SDL_Window *window, TsmVteCtx *vte_ctx) {
     struct tsm_screen *screen = vte_ctx->screen;
 
     int dw, dh;
@@ -364,23 +376,23 @@ static void handle_size_change(ApplicationState *state, SDL_Window *window, TsmV
     int contextType;
     SDL_GL_GetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, &contextType);
 
-    SkCanvas *canvas = glGetCanvas(dw, dh, windowFormat, contextType, state->fWidthScale, state->fHeightScale);
+    SkCanvas *canvas = GrGLGetCanvas(state, windowFormat, contextType, glState);
     if (!canvas) {
         SkDebugf("FATAL: gl state unavailable\n");
         return;
     }
     canvas->clear(term_get_default_bc());
 
-    state->fFontAdvanceWidth = gFont->measureText("X", 1U, SkTextEncoding::kUTF8, nullptr);
-    state->fFontSpacing = std::min(1.0f, gFont->getSpacing());
+    state->fFontAdvanceWidth = glState->font->measureText("X", 1U, SkTextEncoding::kUTF8, nullptr);
+    state->fFontSpacing = std::min(1.0f, glState->font->getSpacing());
 
     int ws_row = std::floorf((dw / state->fWidthScale) / state->fFontAdvanceWidth);
     int ws_col = std::floorf((dh / state->fHeightScale - state->fFontSpacing) / (state->fFontSize + state->fFontSpacing));
 
 #if defined(SK_BUILD_FOR_WIN)
-    update_window_title(window, "cmd.exe", ws_row, ws_col);
+    update_window_title("cmd.exe", ws_row, ws_col, window);
 #else
-    update_window_title(window, "bash", ws_row, ws_col);
+    update_window_title("bash", ws_row, ws_col, window);
 #endif
 
     SkDebugf("resize: cell width %f col %f\n", state->fFontAdvanceWidth, state->fFontSize + state->fFontSpacing);
@@ -391,7 +403,10 @@ static void handle_size_change(ApplicationState *state, SDL_Window *window, TsmV
         SkDebugf("resize_conpty: failed to resize conpty\n");
         return;
     }
-    tsm_screen_resize(screen, ws_row, ws_col);
+    if (tsm_screen_resize(screen, ws_row, ws_col) != 0) {
+        SkDebugf("resize_conpty: failed to resize libtsm\n");
+        return;
+    }
     SkDebugf("term_redraw required\n");
     state->fRedrawRequired = true;
 }
@@ -402,7 +417,8 @@ static long term_read_cb(struct tsm_vte* vte, char* u8, size_t len, bool *is_eof
 #define REFRESH_EVENT     (SDL_USEREVENT + 0)
 #define TTY_INPUT_EVENT   (SDL_USEREVENT + 1)
 
-static void handle_sdl_events(ApplicationState *state, SDL_Window *window, int *rotation, TsmVteCtx *vte_ctx) {
+static void handle_sdl_events(ApplicationState *state, GrGLState *glState, SDL_Window *window, int *rotation,
+                              TsmVteCtx *vte_ctx) {
     SDL_Event event;
 
     struct tsm_screen *screen = vte_ctx->screen;
@@ -442,15 +458,15 @@ static void handle_sdl_events(ApplicationState *state, SDL_Window *window, int *
                     !(modifier & KMOD_ALT)) {
                     if (key == '=' /*SDLK_PLUS*/ && (state->fFontSize + 1.0f) / state->fWidthScale <= 32.0) {
                         state->fFontSize += 1.0 / state->fWidthScale;
-                        gFont->setSize(state->fFontSize);
-                        gFontBold->setSize(state->fFontSize);
-                        handle_size_change(state, window, vte_ctx);
+                        glState->font->setSize(state->fFontSize);
+                        glState->fontBold->setSize(state->fFontSize);
+                        handle_size_change(state, glState, window, vte_ctx);
                         return;
                     } else if (key == SDLK_MINUS && (state->fFontSize - 1.0f) / state->fWidthScale >= 8.0) {
                         state->fFontSize -= 1.0 / state->fWidthScale;
-                        gFont->setSize(state->fFontSize);
-                        gFontBold->setSize(state->fFontSize);
-                        handle_size_change(state, window, vte_ctx);
+                        glState->font->setSize(state->fFontSize);
+                        glState->fontBold->setSize(state->fFontSize);
+                        handle_size_change(state, glState, window, vte_ctx);
                         return;
                     }
                 }
@@ -565,7 +581,7 @@ static void handle_sdl_events(ApplicationState *state, SDL_Window *window, int *
                 switch (event.window.event) {
                     case SDL_WINDOWEVENT_RESIZED:
                         // Use SDL_GL_GetDrawableSize to measure the layout change
-                        handle_size_change(state, window, vte_ctx);
+                        handle_size_change(state, glState, window, vte_ctx);
                         break;
                     default:
                         SkDebugf("sdl: window event %d\n", event.window.event);
@@ -1462,7 +1478,7 @@ static SkColor term_get_default_bc() {
 }
 
 struct draw_ctx {
-    SkCanvas *canvas;
+    GrGLState *glState;
     ApplicationState *state;
     SkPaint *paint;
     bool bcOnly;
@@ -1484,11 +1500,12 @@ static int draw_cb(struct tsm_screen* con,
         ch = chs;
     }
     draw_ctx *ctx = reinterpret_cast<draw_ctx*>(data);
-    SkCanvas* canvas = ctx->canvas;
+    GrGLState *glState = ctx->glState;
+    SkCanvas *canvas = glState->canvas;
     ApplicationState *state = ctx->state;
     SkPaint *paint = ctx->paint;
     bool bcOnly = ctx->bcOnly;
-    const SkFont *font = gFont;
+    const SkFont *font = glState->font.get();
 
     SkString string;
 
@@ -1530,7 +1547,7 @@ static int draw_cb(struct tsm_screen* con,
     }
 
     if (attr->bold) {
-        font = gFontBold;
+        font = glState->fontBold.get();
     }
 
     if (attr->protect) {
@@ -1565,7 +1582,7 @@ static sk_sp<SkImage> draw_star_image(SkCanvas *canvas, float r) {
     return cpuSurface->makeImageSnapshot();
 }
 
-static void draw_vte_screen(SkCanvas *canvas, ApplicationState *state, struct tsm_vte* vte, struct tsm_screen* screen) {
+static void draw_vte_screen(GrGLState *glState, ApplicationState *state, struct tsm_vte* vte, struct tsm_screen* screen) {
     SkPaint paint;
     paint.setAntiAlias(true);
 
@@ -1573,10 +1590,11 @@ static void draw_vte_screen(SkCanvas *canvas, ApplicationState *state, struct ts
     tsm_vte_get_def_attr(vte, &a);
     SkColor bc = term_get_bc_from_attr(&a);
 
+    SkCanvas *canvas = glState->canvas;
     canvas->clear(bc);
     // canvas->clear(SK_ColorTRANSPARENT);
 
-    struct draw_ctx draw_ctx = { canvas, state, &paint, true };
+    struct draw_ctx draw_ctx = { glState, state, &paint, true };
     // draw background
     tsm_screen_draw(screen, draw_cb, &draw_ctx);
 
@@ -1584,15 +1602,6 @@ static void draw_vte_screen(SkCanvas *canvas, ApplicationState *state, struct ts
     draw_ctx.bcOnly = false;
     tsm_screen_draw(screen, draw_cb, &draw_ctx);
 }
-
-
-/* Used by atexit handler */
-#if 1
-static SDL_GLContext glContext = nullptr;
-#else
-static SDL_Renderer* renderer = nullptr;
-#endif
-static SDL_Window* window = nullptr;
 
 #ifdef SK_BUILD_FOR_WIN
 typedef std::pair<int, int> SkDPI;
@@ -1910,6 +1919,10 @@ static void signal_handler(int sig) {
     }
 };
 
+static void exit_handler() {
+    gState->fQuit = true;
+}
+
 #if defined(SK_BUILD_FOR_ANDROID) || defined(SK_BUILD_FOR_WIN)
 int SDL_main(int argc, char** argv) {
 #else
@@ -1972,7 +1985,7 @@ int main(int argc, char** argv) {
 #endif
 
     // embraces exit call in other place
-    std::atexit([]() { gState->fQuit = true; });
+    std::atexit(exit_handler);
 
 #if defined(SK_BUILD_FOR_WIN) && defined(SK_ANGLE)
 #if 0
@@ -1999,18 +2012,17 @@ int main(int argc, char** argv) {
     state.fWidthScale = state.fHeightScale = 1.00;
 #endif
 
-    sk_sp<SkTypeface> typeface = SkTypeface::MakeFromName(DEFAULT_FONT, SkFontStyle::Normal());
-    SkFont font(typeface, state.fFontSize);
-    font.setEdging(SkFont::Edging::kAntiAlias);
-    // font.setHinting(SkFontHinting::kFull);
+    GrGLState glState;
 
-    gFont = &font;
+    glState.typeface = SkTypeface::MakeFromName(DEFAULT_FONT, SkFontStyle::Normal());
+    glState.font = std::make_unique<SkFont>(glState.typeface, state.fFontSize);
+    glState.font->setEdging(SkFont::Edging::kAntiAlias);
+    // glState.font->setHinting(SkFontHinting::kFull);
 
-    sk_sp<SkTypeface> typefaceBold = SkTypeface::MakeFromName(DEFAULT_FONT, SkFontStyle::Bold());
-    SkFont fontBold(typeface, state.fFontSize);
-    fontBold.setEdging(SkFont::Edging::kAntiAlias);
-    // fontBold.setHinting(SkFontHinting::kFull);
-    gFontBold = &fontBold;
+    glState.typefaceBold = SkTypeface::MakeFromName(DEFAULT_FONT, SkFontStyle::Bold());
+    glState.fontBold = std::make_unique<SkFont>(glState.typefaceBold, state.fFontSize);
+    glState.fontBold->setEdging(SkFont::Edging::kAntiAlias);
+    // glState.fontBold->setHinting(SkFontHinting::kFull);
 
     // Setup window
     // This code will create a window with the same resolution as the user's desktop.
@@ -2023,8 +2035,8 @@ int main(int argc, char** argv) {
     SkDebugf("display: width %d height %d\n", dm.w, dm.h);
 
     // SkASSERT(typeface->isFixedPitch());
-    state.fFontAdvanceWidth = gFont->measureText("X", 1U, SkTextEncoding::kUTF8, nullptr);
-    state.fFontSpacing = std::min(1.0f, gFont->getSpacing());
+    state.fFontAdvanceWidth = glState.font->measureText("X", 1U, SkTextEncoding::kUTF8, nullptr);
+    state.fFontSpacing = std::min(1.0f, glState.font->getSpacing());
 
     SkDebugf("default: cell width %f col %f\n", state.fFontAdvanceWidth, state.fFontSize + state.fFontSpacing);
     SkDebugf("default: row %d col %d\n", DEFAULT_ROW, DEFAULT_COL);
@@ -2072,6 +2084,9 @@ int main(int argc, char** argv) {
 
     int posx = (dm.w - state.fDm.w) / 2.0f;
     int posy = (dm.h - state.fDm.h) / 2.0f;
+
+    SDL_Window* window = nullptr;
+
     window = SDL_CreateWindow("SkTerminal", posx, posy, state.fDm.w, state.fDm.h, windowFlags);
 
     if (!window) {
@@ -2088,6 +2103,8 @@ int main(int argc, char** argv) {
 #endif
 
 #if 1
+    SDL_GLContext glContext = nullptr;
+
     glContext = SDL_GL_CreateContext(window);
     if (!glContext) {
         handle_sdl_error();
@@ -2098,6 +2115,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 #else
+    SDL_Renderer* renderer = nullptr;
+
     // try and setup a GL context
     renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (!renderer) {
@@ -2179,10 +2198,7 @@ int main(int argc, char** argv) {
     state.fHeightScale = (double)dh / state.fDm.h;
     SkDebugf("scale: width: %.02f, height: %.02f\n", state.fWidthScale, state.fHeightScale);
 
-    GLState _glState;
-    glState = &_glState;
-
-    SkCanvas *canvas = glGetCanvas(dw, dh, windowFormat, contextType, state.fWidthScale, state.fHeightScale);
+    SkCanvas *canvas = GrGLGetCanvas(&state, windowFormat, contextType, &glState);
     if (!canvas) {
         SkDebugf("FATAL: gl state unavailable\n");
         return -1;
@@ -2194,9 +2210,9 @@ int main(int argc, char** argv) {
     int ws_col = std::floorf((float)(state.fDm.h - state.fFontSpacing) / (state.fFontSize + state.fFontSpacing));
 
 #if defined(SK_BUILD_FOR_WIN)
-    update_window_title(window, "cmd.exe", ws_row, ws_col);
+    update_window_title("cmd.exe", ws_row, ws_col, window);
 #else
-    update_window_title(window, "bash", ws_row, ws_col);
+    update_window_title("bash", ws_row, ws_col, window);
 #endif
 
     SkDebugf("init: row %d col %d\n", ws_row, ws_col);
@@ -2218,7 +2234,10 @@ int main(int argc, char** argv) {
     }
     // increases scrollback size to 500k lines
     tsm_screen_set_max_sb(tsm_vte_ctx.screen, 500000);
-    tsm_screen_resize(tsm_vte_ctx.screen, ws_row, ws_col);
+    if (tsm_screen_resize(tsm_vte_ctx.screen, ws_row, ws_col) != 0) {
+        SkDebugf("tsm_screen_resize failed\n");
+        return -1;
+    }
 
     if (tsm_vte_new(&tsm_vte_ctx.vte, tsm_vte_ctx.screen, term_write_cb, &tsm_vte_ctx, log_tsm, NULL) != 0) {
         SkDebugf("tsm_vte_new failed\n");
@@ -2252,7 +2271,7 @@ int main(int argc, char** argv) {
         state.fShouldRetry = false;
 
         canvas->clear(term_get_default_bc());
-        handle_sdl_events(&state, window, &rotation, &tsm_vte_ctx);
+        handle_sdl_events(&state, &glState, window, &rotation, &tsm_vte_ctx);
         if (state.fQuit) {
             break;
         }
@@ -2278,18 +2297,18 @@ should_retry:
 
 redraw_queued:
         state.fRedrawQueued = false;
-        canvas = glState->canvas;
+        canvas = glState.canvas;
 
         // pass 1: draw terminal canvas
         canvas->save();
-        draw_vte_screen(canvas, &state, tsm_vte_ctx.vte, tsm_vte_ctx.screen);
+        draw_vte_screen(&glState, &state, tsm_vte_ctx.vte, tsm_vte_ctx.screen);
         canvas->restore();
 
         // pass 2: draw star canvas from offline canvas
         canvas->save();
         canvas->translate(state.fDm.w / 2.0 , state.fDm.h / 2.0);
         canvas->rotate(rotation);
-        canvas->drawImage(glState->starImage, -DEFAULT_STAR_RADIUS, -DEFAULT_STAR_RADIUS);
+        canvas->drawImage(glState.starImage, -DEFAULT_STAR_RADIUS, -DEFAULT_STAR_RADIUS);
         canvas->restore();
 
         auto dContext = GrAsDirectContext(canvas->recordingContext());
@@ -2326,12 +2345,16 @@ redraw_queued:
     // Quit SDL subsystems
     SDL_Quit();
 
-    // Cleanup glState At last
-    if (glState) {
-        glState->surface.reset();
-        glState->grContext.reset();
-        glState->glInterface.reset();
-    }
+    // Cleanup GrGLState At last
+    glState.starImage.reset();
+    glState.surface.reset();
+    glState.grContext.reset();
+    glState.glInterface.reset();
+
+    glState.font.reset();
+    glState.typeface.reset();
+    glState.fontBold.reset();
+    glState.typefaceBold.reset();
 
     SkDebugf("main thread exited\n");
 
